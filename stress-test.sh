@@ -4,7 +4,10 @@
 #
 # 用法說明見下面的 usage()，或不帶參數直接執行。
 #
-# 腳本刻意不 cd 到自己所在的目錄：測試產物 (log、fio 測試檔) 都落在
+# 每次執行只產生一份報告，五個項目依 CPU -> RAM -> DISK -> SWAP -> NTP 的順序
+# 寫在同一個檔案裡，最後附一段摘要。
+#
+# 腳本刻意不 cd 到自己所在的目錄：測試產物 (報告、fio 測試檔) 都落在
 # 「你執行時所在的目錄」底下的 logs/，跟腳本放在哪無關。要換地方就 cd 過去再跑。
 
 set -uo pipefail
@@ -21,7 +24,7 @@ usage() {
   stress-test.sh disk          磁碟讀寫
   stress-test.sh swap          SWAP 壓測
   stress-test.sh ntp           NTP 時間偏移 2 分鐘
-  stress-test.sh all           以上全跑 (不含 ntp)
+  stress-test.sh all           以上全跑 (不含 ntp，時鐘要自己單獨測)
 
 參數:
   DUR=60            每項持續秒數
@@ -30,9 +33,8 @@ usage() {
 不落地直接跑 (參數要接在 <(...) 之後):
   bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
 
-測試產物都落在你執行時所在的目錄底下的 logs/。
+每次執行產生一份報告 logs/<項目>-<時間戳>.log，五項依序寫在同一個檔案裡。
 EOF
-    # LOGDIR 在下面才建立，這裡用預設值擋著 set -u
     echo "這次的輸出會寫到: ${LOGDIR:-<尚未建立>}"
 }
 
@@ -45,7 +47,7 @@ case "$DUR" in ''|*[!0-9]*) echo "DUR 要是正整數，收到: $DUR"; exit 2 ;;
 [ "$DUR" -ge 1 ] || { echo "DUR 要 >= 1"; exit 2; }
 
 # 相對於 CWD 建立，再轉成絕對路徑存起來。
-# 轉絕對路徑有兩個好處：log 裡印出的路徑不會有「這是相對誰」的疑問，
+# 轉絕對路徑有兩個好處：報告裡印出的路徑不會有「這是相對誰」的疑問，
 # 而且之後任何 cd 都不會讓 trap 清錯檔案。
 LOGDIR="./logs"
 mkdir -p "$LOGDIR" || { echo "無法在目前目錄建立 logs/ (pwd: $PWD)"; exit 1; }
@@ -58,15 +60,30 @@ mkdir -p "$DISK_DIR" || { echo "無法建立 $DISK_DIR"; exit 1; }
 DISK_DIR="$(cd "$DISK_DIR" && pwd)"
 TS=$(date +%Y%m%d-%H%M%S)
 
+# 整份報告就一個檔案，主流程決定檔名後才設定
+LOG=""
+
 # fio 測試檔的路徑存成全域，讓中斷時的 trap 也清得到。
 # t_disk 自己的 RETURN trap 只在正常返回時觸發，Ctrl-C 走的是下面這條，
-# 不處理的話會留一個 1.4GB 的檔案在 logs/ 裡。
+# 不處理的話會留一個 4GB 的檔案在 logs/ 裡。
 FIO_FILE=""
 # t_swap 動過的 sshd oom_score_adj，格式 "pid:原值 pid:原值"
 OOM_SAVED=""
 
-# 腳本被 Ctrl-C / kill 時：收掉背景監看 + 還原 oom_score_adj + 清掉測試檔
-trap 'mon_stop 2>/dev/null; oom_restore 2>/dev/null; [ -n "$FIO_FILE" ] && rm -f "$FIO_FILE"; echo; echo "已中斷，已清理"; exit 130' INT TERM
+# ---------- 摘要用的全域 ----------
+# 每個 t_* 跑完自己填。沒跑到的維持「未執行」，摘要才會永遠列滿五項，
+# 讓人一眼看出「這項沒測」而不是「這項沒問題」-- 兩者差很多。
+SUM_CPU="未執行"
+SUM_RAM="未執行"
+SUM_DISK="未執行"
+SUM_SWAP="未執行"
+SUM_NTP="未執行 (需單獨執行 ntp)"
+WARNINGS=""
+
+# 腳本被 Ctrl-C / kill 時：收掉背景監看 + 還原 oom_score_adj + 清掉測試檔，
+# 然後把已經跑完的部分做成摘要 -- 中斷不該讓前面的結果白跑
+trap 'mon_stop 2>/dev/null; oom_restore 2>/dev/null; [ -n "$FIO_FILE" ] && rm -f "$FIO_FILE"
+      echo; echo "已中斷，已清理"; [ -n "$LOG" ] && report_summary "已中斷"; exit 130' INT TERM
 
 # 掃掉上次沒清乾淨的殘骸 (例如被 kill -9)
 _scan_stale() {
@@ -87,15 +104,106 @@ need() {
     local miss=""
     for t in "$@"; do command -v "$t" >/dev/null 2>&1 || miss="$miss $t"; done
     [ -z "$miss" ] && return 0
-    echo "缺少工具:$miss"
-    echo "  yum install -y fio sysstat stress-ng chrony"
+    log "缺少工具:$miss"
+    log "  yum install -y fio sysstat stress-ng chrony"
     return 1
 }
 
-# LOG 要到 head_ 才建立。中斷 trap 可能在那之前就呼叫到 log()，
+# ---------- 排版 ----------
+RULE=$(printf '%.0s=' {1..78})
+THIN=$(printf '%.0s-' {1..78})
+
+# LOG 要到主流程才建立。中斷 trap 可能在那之前就呼叫到 log()，
 # 這時 set -u 會讓整個 trap 炸掉，所以給個預設值。
 log()  { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${LOG:-/dev/null}"; }
-head_() { LOG="$LOGDIR/$1-$TS.log"; echo "=== $1 壓測 / $(date) / ${DUR}s ===" | tee "$LOG"; }
+
+# 警告同時進報告本文與摘要。摘要裡再列一次是刻意的：
+# 跑 all 時本文有好幾百行，警告很容易被捲過去。
+warn() {
+    log "  !! $*"
+    WARNINGS="$WARNINGS
+  !! $*"
+}
+
+# sec <編號> <標題> -- 章節標頭。
+# 編號固定用 n/5 的正式順序 (CPU=1 RAM=2 DISK=3 SWAP=4 NTP=5)，
+# 就算只跑單項也看得出它在整體流程裡的位置。
+sec() {
+    { echo
+      echo
+      echo "$RULE"
+      echo "  $1  $2"
+      echo "$RULE"
+    } | tee -a "$LOG"
+}
+
+report_head() {
+    local model
+    model=$(awk -F: '/model name/{sub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo)
+    { echo "$RULE"
+      echo "                              壓 力 測 試 報 告"
+      echo "$RULE"
+      echo
+      echo "  主機          $(hostname)"
+      echo "  作業系統      $(sed -n '1p' /etc/redhat-release 2>/dev/null || uname -o)"
+      echo "  核心版本      $(uname -r)"
+      echo "  虛擬化        $(systemd-detect-virt 2>/dev/null || echo '未知')"
+      echo "  CPU           ${model:-未知}"
+      echo "  核心數        $(getconf _NPROCESSORS_ONLN)"
+      echo "  記憶體        $(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo)"
+      echo "  SWAP          $(awk '/SwapTotal/{printf "%d MB", $2/1024}' /proc/meminfo)"
+      echo
+      echo "  執行項目      $1"
+      echo "  每項持續      ${DUR} s"
+      echo "  開始時間      $(date '+%F %T %Z')"
+      echo "  報告位置      $LOG"
+      echo "  fio 測試檔    $DISK_DIR"
+    } | tee "$LOG"
+}
+
+# sum_row <標籤> <內容>，內容可以是多行，續行自動對齊
+sum_row() {
+    local label="$1" first=1 l
+    while IFS= read -r l; do
+        if [ "$first" = 1 ]; then printf '  %-6s %s\n' "$label" "$l"; first=0
+        else                      printf '  %-6s %s\n' ""      "$l"; fi
+    done <<< "$2"
+}
+
+report_summary() {
+    { echo
+      echo
+      echo "$RULE"
+      echo "  摘要${1:+  ($1)}"
+      echo "$RULE"
+      echo
+      sum_row "CPU"  "$SUM_CPU"
+      sum_row "RAM"  "$SUM_RAM"
+      sum_row "DISK" "$SUM_DISK"
+      sum_row "SWAP" "$SUM_SWAP"
+      sum_row "NTP"  "$SUM_NTP"
+      echo
+      if [ -n "$WARNINGS" ]; then
+          echo "$THIN"
+          echo "  警告"
+          echo "$THIN"
+          echo "$WARNINGS"
+          echo
+      fi
+      echo "$THIN"
+      echo "  判讀提示"
+      echo "$THIN"
+      echo "  * steal 持續 >0 代表 CPU 被 hypervisor 拿去給別的 VM，"
+      echo "    此時 bogo ops 低是 host 超賣，不是這台機器的問題。"
+      echo "  * VM 內的磁碟「讀取」數據普遍不可信 -- guest 的 direct=1 繞不過"
+      echo "    hypervisor 的 cache。以「寫入的 p99 尾端延遲」為準。"
+      echo "  * 平均延遲會把快慢兩群混在一起。p99 才是你的服務真正會遇到的。"
+      echo
+      echo "  結束時間      $(date '+%F %T %Z')"
+      echo "  完整報告      $LOG"
+      echo "$RULE"
+    } | tee -a "$LOG"
+}
 
 # ---------- 背景監看 ----------
 # 血淚教訓：不要寫成  ( while ...; done ) | sed | tee &
@@ -139,6 +247,12 @@ mon_stop() {
     _killtree "$MON_PID"
     MON_PID=""
 }
+
+# 取得目前報告的行數，之後用 tail -n +N 就能只撈這一段的監看數據。
+# 報告現在是單一檔案，不記位置的話會把前面項目的數據也算進來。
+mark() { wc -l < "$LOG"; }
+# since <行號> -- 印出該行之後的報告內容
+since() { tail -n +$(( $1 + 1 )) "$LOG"; }
 
 # ---------- OOM 保護的還原 ----------
 # oom_score_adj=-1000 等於永久豁免 OOM killer，測完不還原的話，
@@ -193,15 +307,26 @@ _mon_cpu() {
     done
 }
 t_cpu() {
-    need stress-ng mpstat || return 1
-    head_ cpu
-    local n; n=$(getconf _NPROCESSORS_ONLN)
-    log "拉滿 $n 核，${DUR}s"
+    sec "1/5" "CPU"
+    need stress-ng mpstat || { SUM_CPU="跳過 (缺工具)"; return 1; }
+    local n m ops steal
+    n=$(getconf _NPROCESSORS_ONLN)
+    log "拉滿 $n 核，${DUR}s，方法 all"
+    m=$(mark)
     mon_start _mon_cpu
     stress-ng --cpu "$n" --cpu-method all -t "${DUR}s" --metrics-brief 2>&1 | tee -a "$LOG"
     mon_stop
-    log "完成 -> $LOG"
-    log "註: steal 若持續 >0，代表 host 超賣，bogo ops 低不是這台 VM 的問題"
+
+    # stress-ng --metrics-brief 的資料行:
+    #   stress-ng: info:  [23801] cpu   9360   10.03   39.67   0.01   933.17   235.89
+    #   $4=stressor $5=bogo ops ...      $(NF-1)=bogo ops/s (real time)
+    ops=$(since "$m" | awk '$4=="cpu" && $5 ~ /^[0-9]+$/ {print $(NF-1)}' | tail -1)
+    steal=$(since "$m" | grep -oE 'steal=[0-9.]+' | cut -d= -f2 | sort -rn | head -1)
+    SUM_CPU="${ops:-?} bogo ops/s (${n} 核)，steal 峰值 ${steal:-?}%"
+    # steal 超過幾個百分點就代表 host 上有人在跟你搶 CPU
+    if [ -n "$steal" ] && awk -v s="$steal" 'BEGIN{exit !(s > 5)}'; then
+        warn "CPU steal 峰值 ${steal}% -> host 超賣，這個 bogo ops 不代表這台 VM 的實力"
+    fi
 }
 
 # ---------- RAM ----------
@@ -213,17 +338,26 @@ _mon_ram() {
     done
 }
 t_ram() {
-    need stress-ng || return 1
-    head_ ram
+    sec "2/5" "RAM"
+    need stress-ng || { SUM_RAM="跳過 (缺工具)"; return 1; }
     # 總記憶體的 80%，分 2 個 worker
-    local total_mb per_mb
+    local total_mb per_mb m ops minavail
     total_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
     per_mb=$(( total_mb * 80 / 100 / 2 ))
     log "總 ${total_mb}MB，2 worker x ${per_mb}MB = $(( per_mb*2 ))MB (80%)"
+    m=$(mark)
     mon_start _mon_ram
     stress-ng --vm 2 --vm-bytes "${per_mb}M" --vm-keep -t "${DUR}s" --metrics-brief 2>&1 | tee -a "$LOG"
     mon_stop
-    log "完成 -> $LOG"
+
+    ops=$(since "$m" | awk '$4=="vm" && $5 ~ /^[0-9]+$/ {print $(NF-1)}' | tail -1)
+    minavail=$(since "$m" | grep -oE 'MemAvailable=[0-9]+' | cut -d= -f2 | sort -n | head -1)
+    SUM_RAM="${ops:-?} bogo ops/s，配置 $(( per_mb*2 ))MB，最低可用 ${minavail:-?}MB"
+    # bogo ops 為 0 不是壞掉，是 DUR 太短跑不完一輪 -- 講清楚免得被當成故障
+    if [ "${ops:-1}" = "0" ] || [ "${ops:-1}" = "0.00" ]; then
+        SUM_RAM="$SUM_RAM
+(bogo ops 0 = ${DUR}s 內跑不完一輪，DUR 加大即可)"
+    fi
 }
 
 # ---------- SWAP ----------
@@ -239,20 +373,19 @@ _mon_swap() {
     done
 }
 t_swap() {
-    need stress-ng vmstat || return 1
-    head_ swap
-    local total_mb swap_mb target_mb
+    sec "4/5" "SWAP"
+    need stress-ng vmstat || { SUM_SWAP="跳過 (缺工具)"; return 1; }
+    local total_mb swap_mb target_mb m p old maxso minavail oom
     total_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
     swap_mb=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
     swap_mb="${swap_mb:-0}"
-    [ "$swap_mb" -eq 0 ] && { log "沒有 swap，跳過"; return; }
+    [ "$swap_mb" -eq 0 ] && { log "沒有 swap，跳過"; SUM_SWAP="跳過 (這台沒有 swap)"; return; }
     # RAM 的 95% + swap 的 50%，逼出換頁但不至於 OOM
     target_mb=$(( total_mb * 95 / 100 + swap_mb / 2 ))
     log "RAM=${total_mb}MB swap=${swap_mb}MB -> 吃 ${target_mb}MB，逼出換頁"
-    log "!! OOM killer 可能出手。監看: dmesg -w"
+    log "!! OOM killer 可能出手。另開一個 terminal 跑 dmesg -w 可以即時看到"
 
     # 保護 sshd 不被 OOM 殺掉。先存原值，測完由 oom_restore 還原。
-    local p old
     OOM_SAVED=""
     for p in $(pgrep -x sshd 2>/dev/null); do
         old=$(cat "/proc/$p/oom_score_adj" 2>/dev/null) || continue
@@ -261,46 +394,61 @@ t_swap() {
     [ -n "$OOM_SAVED" ] && log "已把 sshd 的 oom_score_adj 設成 -1000 (測完還原)"
     trap 'oom_restore' RETURN
 
+    m=$(mark)
     mon_start _mon_swap
     stress-ng --vm 1 --vm-bytes "${target_mb}M" --vm-keep -t "${DUR}s" --metrics-brief 2>&1 | tee -a "$LOG"
     mon_stop
 
-    log "--- OOM 記錄 ---"
+    maxso=$(since "$m" | grep -oE 'so=[0-9]+' | cut -d= -f2 | sort -rn | head -1)
+    minavail=$(since "$m" | grep -oE 'MemAvailable=[0-9]+' | cut -d= -f2 | sort -n | head -1)
+
+    echo "$THIN" | tee -a "$LOG"
+    log "OOM 記錄"
     # 先 grep 再 tail。反過來的話 OOM 之後只要再多幾行 kernel 訊息，記錄就被 tail 切掉了。
-    dmesg | grep -iE 'oom|killed process' | tail -30 | tee -a "$LOG" || log "(無 OOM)"
-    log "完成 -> $LOG"
+    oom=$(dmesg | grep -iE 'oom|killed process' | tail -30)
+    if [ -n "$oom" ]; then
+        printf '%s\n' "$oom" | sed 's/^/  /' | tee -a "$LOG"
+        warn "SWAP 測試期間出現 OOM 記錄，請確認被殺掉的是哪些程序"
+        SUM_SWAP="換出峰值 ${maxso:-?} KB/s，最低可用 ${minavail:-?}MB，!! 有 OOM 記錄"
+    else
+        log "  (無 OOM)"
+        SUM_SWAP="換出峰值 ${maxso:-?} KB/s，最低可用 ${minavail:-?}MB，無 OOM"
+    fi
 }
 
 # ---------- DISK ----------
 t_disk() {
-    need fio || return 1
-    head_ disk
-    local avail_mb size
+    sec "3/5" "DISK"
+    need fio || { SUM_DISK="跳過 (缺工具)"; return 1; }
+    local avail_mb size mem_mb rt mode out iops bw_str bw p99 punit p99ms line
     avail_mb=$(df -Pm "$DISK_DIR" | awk 'NR==2{print $4}')
     # 測試檔要大於 RAM 才不會被 page cache 整份吃掉；空間不夠就取可用空間的一半
     size=$(( avail_mb / 2 ))
     [ "$size" -gt 4096 ] && size=4096
-    [ "$size" -lt 512 ] && { log "$DISK_DIR 只剩 ${avail_mb}MB，空間不足"; return 1; }
+    [ "$size" -lt 512 ] && { log "$DISK_DIR 只剩 ${avail_mb}MB，空間不足"; SUM_DISK="跳過 (空間不足，只剩 ${avail_mb}MB)"; return 1; }
     log "$DISK_DIR 可用 ${avail_mb}MB -> 測試檔 ${size}MB"
-    log "註: direct=1 繞過 page cache，量的是真實磁碟"
+    log "註: direct=1 繞過 guest 的 page cache，但繞不過 KVM host 的"
 
     # 存全域而不是 local，頂層的 INT/TERM trap 才清得到同一個檔案
     FIO_FILE="$DISK_DIR/.fio-test.$$"
     trap 'rm -f "$FIO_FILE"; FIO_FILE=""; log "已清掉測試檔"' RETURN
 
-    local mem_mb; mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-    if [ "$size" -lt "$mem_mb" ]; then
-        log "!! 測試檔 ${size}MB < RAM ${mem_mb}MB，讀取數據會被 cache 汙染"
-    fi
+    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    [ "$size" -lt "$mem_mb" ] && warn "測試檔 ${size}MB < RAM ${mem_mb}MB，讀取數據會被 cache 汙染"
 
     # DUR < 4 時整數除法會得到 0，而 fio 的 --runtime=0 是「不設限」，
     # 配上 --time_based 就永遠跑不完。至少留 1 秒。
-    local rt=$(( DUR / 4 )); [ "$rt" -lt 1 ] && rt=1
+    rt=$(( DUR / 4 )); [ "$rt" -lt 1 ] && rt=1
+    log "每個模式跑 ${rt}s (DUR 四等分)"
+    # 太短的話 iodepth=32 只發得出幾十個 IO，百分位數純粹是雜訊。
+    # 不講的話它會安靜地產出看起來很正常、實際沒意義的數字。
+    [ "$rt" -lt 5 ] && warn "每個模式只有 ${rt}s，IO 樣本太少，百分位數不具參考價值 (建議 DUR>=240)"
 
-    local mode out bw
+    SUM_DISK=""
     for mode in "randread 隨機讀" "randwrite 隨機寫" "read 循序讀" "write 循序寫"; do
         set -- $mode
-        log "--- $2 ($1) ---"
+        echo "$THIN" | tee -a "$LOG"
+        log "$2 ($1)"
         out=$(fio --name="$1" --filename="$FIO_FILE" --size="${size}M" \
             --rw="$1" --bs=$([ "${1#rand}" = "$1" ] && echo 1M || echo 4k) \
             --ioengine=libaio --iodepth=32 --direct=1 \
@@ -308,9 +456,26 @@ t_disk() {
 
         # 收 IOPS/BW、平均延遲、以及 p95/p99/p99.99 尾端延遲。
         # 尾端才是重點：共享雲端磁碟的平均值好看，p99 會差兩個數量級。
+        # 一定要一起收 "clat percentiles (usec):" 那行 -- fio 會依數值大小自己換單位，
+        # 少了它，log 裡的 848 和 3473 長得一模一樣，實際上差 1000 倍。
         printf '%s\n' "$out" \
-            | grep -E 'IOPS=|BW=|lat \((usec|msec|nsec)\): min=|95\.00th|99\.00th|99\.99th' \
+            | grep -E 'IOPS=|BW=|lat \((usec|msec|nsec)\): min=|percentiles \(|95\.00th|99\.00th|99\.99th' \
             | sed 's/^/  /' | tee -a "$LOG"
+
+        iops=$(printf '%s\n' "$out" | grep -oE 'IOPS=[0-9.]+k?' | head -1 | cut -d= -f2)
+        bw_str=$(printf '%s\n' "$out" | grep -oE 'BW=[0-9.]+[KMGT]iB/s' | head -1 | cut -d= -f2)
+        # 百分位數的單位由 "clat percentiles (usec):" 決定，不是固定的
+        punit=$(printf '%s\n' "$out" | sed -nE 's/.*clat percentiles \((usec|msec|nsec)\).*/\1/p' | head -1)
+        p99=$(printf '%s\n' "$out" | sed -nE 's/.*99\.00th=\[[[:space:]]*([0-9]+)\].*/\1/p' | head -1)
+        # 統一換算成 ms 才能跨模式比較
+        if [ -n "$p99" ] && [ -n "$punit" ]; then
+            p99ms=$(awk -v v="$p99" -v u="$punit" 'BEGIN{
+                if (u=="usec") v/=1000; else if (u=="nsec") v/=1000000
+                printf "%.1fms", v }')
+        else
+            p99ms="?"
+        fi
+        line=$(printf '%s  %-8s IOPS  %-12s p99 %s' "$2" "${iops:-?}" "${bw_str:-?}" "$p99ms")
 
         # host cache 偵測：guest 的 direct=1 繞不過 hypervisor 的 cache。
         # 一般雲端磁碟不可能超過 2GB/s，超過就是在量 host RAM 不是磁碟。
@@ -322,18 +487,19 @@ t_disk() {
               if (/KiB/) v /= 1024; else if (/GiB/) v *= 1024; else if (/TiB/) v *= 1048576
               printf "%d", v }')
         if [ -n "$bw" ] && [ "$bw" -gt 2000 ]; then
-            log "  !! ${bw}MiB/s 超出實體磁碟合理範圍 -> 這是 KVM host 的 cache，此數據無效"
+            warn "$2 ${bw}MiB/s 超出實體磁碟合理範圍 -> 這是 KVM host 的 cache，此數據無效"
+            line="$line   !! 無效 (host cache)"
         fi
+        SUM_DISK="${SUM_DISK:+$SUM_DISK
+}$line"
     done
-    log "完成 -> $LOG"
-    log "註: VM 內的讀取數據普遍不可信 (host cache)，以寫入的 p99 尾端延遲為準"
 }
 
 # ---------- NTP 時間偏移 ----------
 NTP_SHIFTED=0
 t_ntp() {
-    need chronyc || return 1
-    head_ ntp
+    sec "5/5" "NTP"
+    need chronyc || { SUM_NTP="跳過 (缺工具)"; return 1; }
     local before after
     before=$(date '+%F %T')
     log "現在時間: $before"
@@ -341,7 +507,8 @@ t_ntp() {
 
     # 一定要有還原保險：腳本被 Ctrl-C 也要把時鐘拉回來
     restore_ntp() {
-        log "--- 還原 ---"
+        echo "$THIN" | tee -a "$LOG"
+        log "還原"
         # 先把自己撥掉的 2 分鐘扣回來。只靠 chronyc makestep 的話，
         # 機器連不到 NTP 來源時時鐘就一直錯 2 分鐘；這一步是確定性的，不依賴網路。
         # NTP_SHIFTED 擋重入：這個函式若跑兩次就會倒扣 4 分鐘。
@@ -358,12 +525,13 @@ t_ntp() {
         sleep 3
         log "還原後: $(date '+%F %T')"
         chronyc tracking 2>&1 | grep -E 'System time|Last offset' | sed 's/^/  /' | tee -a "$LOG"
+        SUM_NTP="偏移 +2min 觀察 ${DUR}s 後已還原 (現在 $(date '+%T'))"
     }
     # RETURN 管正常結束。INT/TERM 要自己收尾：先關掉 RETURN trap 避免還原跑兩次
     # (Ctrl-C 會中斷 sleep -> 跑 INT handler -> 函式繼續往下 return -> RETURN trap 又觸發)，
     # 而且要自己 exit 130，不然中斷後 exit code 會是 0。
     trap 'restore_ntp' RETURN
-    trap 'trap - RETURN; restore_ntp; echo; echo "已中斷，已還原"; exit 130' INT TERM
+    trap 'trap - RETURN; restore_ntp; echo; echo "已中斷，已還原"; report_summary "已中斷"; exit 130' INT TERM
 
     log "停掉 chronyd (不停的話兩秒後就被拉回，你會以為沒生效)"
     systemctl stop chronyd
@@ -374,24 +542,38 @@ t_ntp() {
         NTP_SHIFTED=1
     else
         log "date -s 失敗，取消測試"
+        SUM_NTP="失敗 (date -s 沒成功)"
         return 1    # RETURN trap 會把 chronyd 拉回來
     fi
     after=$(date '+%F %T')
     log "偏移後: $after"
 
-    log "--- 觀察 ${DUR}s，這期間去看你的應用有沒有異常 ---"
-    log "    (TLS 憑證驗證 / cron / DB replication / log 時序都可能出事)"
+    echo "$THIN" | tee -a "$LOG"
+    log "觀察 ${DUR}s -- 這期間去看你的應用有沒有異常"
+    log "  TLS 憑證驗證 / cron / DB replication / log 時序都可能出事"
     sleep "$DUR"
     # trap RETURN 會自動呼叫 restore_ntp
 }
 
 # ---------- 主 ----------
+# 先驗參數再決定報告檔名，打錯字不該留下一個空報告
 case "${1:-}" in
+    cpu|ram|disk|swap|ntp|all) CMD="$1" ;;
+    *) usage; exit 2 ;;
+esac
+
+LOG="$LOGDIR/$CMD-$TS.log"
+report_head "$CMD"
+
+case "$CMD" in
     cpu)   t_cpu ;;
     ram)   t_ram ;;
     disk)  t_disk ;;
     swap)  t_swap ;;
     ntp)   t_ntp ;;
+    # 順序固定 CPU -> RAM -> DISK -> SWAP。ntp 不含在內：時鐘是全機共用的狀態，
+    # 順手跑掉風險太高，要測就自己單獨跑。
     all)   t_cpu; t_ram; t_disk; t_swap ;;
-    *)  usage; exit 2 ;;
 esac
+
+report_summary
