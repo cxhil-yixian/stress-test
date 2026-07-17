@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
+#
 # stress-test.sh -- 壓力測試 (CentOS 7.9 / KVM VM)
 #
-# 用法:
-#   ./stress-test.sh cpu           CPU 壓測
-#   ./stress-test.sh ram           記憶體壓測
-#   ./stress-test.sh disk          磁碟讀寫
-#   ./stress-test.sh swap          SWAP 壓測
-#   ./stress-test.sh ntp           NTP 時間偏移 2 分鐘
-#   ./stress-test.sh all           以上全跑 (不含 ntp)
+# 用法說明見下面的 usage()，或不帶參數直接執行。
 #
-# 參數:
-#   DUR=60            每項持續秒數
-#   DISK_DIR=./logs   fio 測試檔位置 (測完自動刪除)
-#
-# 測試產物 (log、fio 測試檔) 都落在「你執行時所在的目錄」底下的 logs/，
-# 跟腳本放在哪無關。要換地方就 cd 過去再跑。
+# 腳本刻意不 cd 到自己所在的目錄：測試產物 (log、fio 測試檔) 都落在
+# 「你執行時所在的目錄」底下的 logs/，跟腳本放在哪無關。要換地方就 cd 過去再跑。
 
 set -uo pipefail
 
-# 不 cd 到腳本所在目錄 -- 測試產物要跟著「執行時的目錄」走，腳本放哪不影響。
-# 但 usage() 得讀自己，而 $0 可能是相對路徑 (bash ../x/stress-test.sh)，
-# 所以先在子 shell 裡解析出絕對路徑，不動到外面的 CWD。
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# 用法說明寫成字串常數，不要回頭讀腳本自己。
+# bash <(curl -fsSL ...) 這類跑法餵給 bash 的是一次性的 pipe (/dev/fd/63)，
+# bash 讀完腳本後它就到 EOF 了，回頭讀只會拿到空字串 --
+# 而「參數打錯」正是最需要用法說明的時候。
+usage() {
+    cat <<'EOF'
+用法:
+  stress-test.sh cpu           CPU 壓測
+  stress-test.sh ram           記憶體壓測
+  stress-test.sh disk          磁碟讀寫
+  stress-test.sh swap          SWAP 壓測
+  stress-test.sh ntp           NTP 時間偏移 2 分鐘
+  stress-test.sh all           以上全跑 (不含 ntp)
+
+參數:
+  DUR=60            每項持續秒數
+  DISK_DIR=./logs   fio 測試檔位置 (測完自動刪除)
+
+不落地直接跑 (參數要接在 <(...) 之後):
+  bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
+
+測試產物都落在你執行時所在的目錄底下的 logs/。
+EOF
+    # LOGDIR 在下面才建立，這裡用預設值擋著 set -u
+    echo "這次的輸出會寫到: ${LOGDIR:-<尚未建立>}"
+}
 
 # 先驗身分再建目錄，不然非 root 執行會留下一個空的 logs/ 才跟你說不能跑
 [ "$(id -u)" = "0" ] || { echo "要 root"; exit 1; }
@@ -68,13 +81,6 @@ _scan_stale "$LOGDIR"
 # DISK_DIR 指到別的地方時那邊也要掃。-ef 比對 device+inode，
 # 所以 ./logs 跟 logs 跟 /abs/path/logs 都認得出是同一個目錄，不會掃兩次。
 [ "$DISK_DIR" -ef "$LOGDIR" ] || _scan_stale "$DISK_DIR"
-
-# 印出檔案開頭那段用法說明 (shebang 之後、第一個非註解行之前)。
-# 不寫死行號，改動上面的註解區塊不用回來同步。
-usage() {
-    awk 'NR>1{ if (!/^#/) exit; sub(/^# ?/,""); print }' "$SELF"
-    echo "這次的輸出會寫到: $LOGDIR"
-}
 
 # 缺工具時給明確訊息，而不是讓它噴 command not found
 need() {

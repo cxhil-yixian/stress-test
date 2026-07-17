@@ -26,6 +26,21 @@
 
   工具缺少時腳本會明確指出缺哪幾個，不會噴 `command not found`。
 
+## 取得
+
+```bash
+curl -fsSL -o stress-test.sh https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
+chmod +x stress-test.sh
+```
+
+也可以不落地直接跑。**參數要接在 `<(...)` 後面**：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
+```
+
+用 `bash <(...)` 而不是 `curl ... | bash`：後者腳本是從 stdin 讀進來的，測試工具若有任何動到 stdin 的行為，就會把還沒讀到的腳本內容吃掉。
+
 ## 用法
 
 ```bash
@@ -37,7 +52,7 @@
 ./stress-test.sh all     # 跑 cpu / ram / disk / swap（不含 ntp）
 ```
 
-不帶參數執行會印出用法說明。
+不帶參數執行會印出用法說明與這次的輸出目錄。
 
 ### 輸出位置
 

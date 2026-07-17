@@ -6,7 +6,15 @@
 
 目標平台是 **CentOS 7.9**，即 Bash 4.2 + systemd + yum。不要用 Bash 5 才有的語法（`${var@Q}`、關聯陣列的 `-A` 進階用法等）。
 
-**腳本刻意不 `cd` 到自己所在的目錄** —— 測試產物要跟著使用者的 CWD 走。所以任何需要讀取腳本自身的地方（目前只有 `usage()`）都必須用 `$SELF`（啟動時解析好的絕對路徑），不能用 `$0`：`bash ../tools/stress-test.sh` 這種呼叫方式下 `$0` 是相對路徑，而 CWD 不保證是它的基準。同理，`LOGDIR` / `DISK_DIR` 啟動時就轉成絕對路徑，之後不管誰 cd 都不會清錯檔案。
+**腳本刻意不 `cd` 到自己所在的目錄** —— 測試產物要跟著使用者的 CWD 走。`LOGDIR` / `DISK_DIR` 啟動時就轉成絕對路徑，之後不管誰 cd 都不會清錯檔案。
+
+**腳本絕不能依賴自身路徑，也不能回頭讀取自己**（`$0`、`${BASH_SOURCE[0]}`、`cat "$0"` 全部禁用）。常見跑法是：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
+```
+
+這時腳本來源是一次性的 pipe（`/dev/fd/63`），bash 讀完就到 EOF；`$0` 指向那個 fd，回頭讀只會拿到空字串。`usage()` 曾經用 awk 擷取檔案開頭的註解區塊，就是踩到這個 —— 而且只在「參數打錯」時才會顯現，最不容易測到。所以用法說明是 `usage()` 裡的 here-doc 字串常數，改動時直接改那段。
 
 ## 語言
 
@@ -56,7 +64,20 @@ shellcheck stress-test.sh   # 若可用
 7. **`%steal` 是 KVM guest 的核心指標**，不要為了精簡輸出把它拿掉。mpstat 的欄位順序跨版本會變，所以 `_mon_cpu` 從表頭找欄號，找不到才退回寫死的位置。
 
 8. **新增測試項目時的模式：**
-   `need <工具...> || return 1` → `head_ <名稱>` → `log` 說明參數 → `mon_start _mon_xxx` → 主壓測（`2>&1 | tee -a "$LOG"`）→ `mon_stop` → `log "完成 -> $LOG"`。同時更新頂部的用法註解區塊與 `case` 分支即可 —— `usage()` 會自動擷取 shebang 之後、第一個非註解行之前的內容，不需要同步任何行號。
+   `need <工具...> || return 1` → `head_ <名稱>` → `log` 說明參數 → `mon_start _mon_xxx` → 主壓測（`2>&1 | tee -a "$LOG"`）→ `mon_stop` → `log "完成 -> $LOG"`。同時更新 `usage()` 裡的 here-doc 與 `case` 分支。
+
+## 驗證跑法
+
+改動後至少要確認三種跑法都正常，特別是 `usage()` 相關的改動：
+
+```bash
+bash -n stress-test.sh                 # 語法
+bash /path/to/stress-test.sh           # 一般檔案執行
+bash <(cat stress-test.sh)             # process substitution (等同 bash <(curl ...))
+cat stress-test.sh | bash -s --        # stdin
+```
+
+後兩者是實際最常見的用法，也是最容易壞掉而沒人發現的。非 root 會卡在權限檢查，把那行暫時改成恆真即可測到 `usage()`。
 
 ## 文件同步
 
