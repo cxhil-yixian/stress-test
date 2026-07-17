@@ -734,9 +734,14 @@ _dl_worker() {
     local urls=("$@") i=0 total=0 got
     echo 0 > "$sf"
     while [ "$(date +%s)" -lt "$deadline" ]; do
+        # 關鍵：不要用 `|| got=0`。大檔 (例如 1GB) 在 --max-time 內下不完時，
+        # curl 會以 exit 28 (逾時) 結束 -- 但那 30 秒它其實下載了幾十 MB，而且
+        # --write-out 的 size_download 照樣印到 stdout。用 `|| got=0` 會把這些
+        # 實際灌出去的流量全部歸零 (Cloud180 實測: 網卡收了 55MB，卻回報下載 21KB)。
+        # 逾時本來就是「持續灌流量」的正常狀態，size_download 要照收。
         got=$(curl --location --silent --show-error --connect-timeout 10 --max-time 30 \
                    $CURL_K --output /dev/null --write-out '%{size_download}' \
-                   "${urls[$(( i % ${#urls[@]} ))]}" 2>/dev/null) || got=0
+                   "${urls[$(( i % ${#urls[@]} ))]}" 2>/dev/null)
         case "$got" in ''|*[!0-9]*) got=0 ;; esac
         total=$(( total + got )); i=$(( i + 1 ))
         echo "$total" > "$sf"
