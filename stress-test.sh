@@ -36,20 +36,24 @@ usage() {
   DISK_DIR=./logs   fio 測試檔位置 (測完自動刪除)
 
 網路測試參數 (URL/DL_URL 沒有預設，必須自己給授權的目標):
-  URL=https://你的網站/            wrk 壓測目標
+  URL=http://127.0.0.1/            wrk 壓測目標，只能是你自己的網站
   DL_URL=https://來源/big.bin      curl 下載來源，逗號分隔可多個
   WRK_THREADS=2  WRK_CONNS=50      wrk 執行緒 / 連線數
   DL_WORKERS=4                     同時幾個 curl 下載程序
   HOST_HEADER=  UA=stress-test/1.0 自訂 Host / User-Agent
   INSECURE=1                       跳過 TLS 驗證 (測自簽憑證的內部站才用)
 
+  URL 只能填你有權壓測的網站 (通常是本機 127.0.0.1)，wrk 會產生真實高併發
+  請求，打別人的站等同 DoS。DL_URL 建議用自己的檔案來源；公開測速檔 (如
+  ash-speed.hetzner.com/1GB.bin) 只適合短時間驗證，別長時間連續灌。
+
 範例:
-  URL=https://web.local/ DUR=60 stress-test.sh baseline
-  DL_URL=https://a/1G.bin,https://b/1G.bin DL_WORKERS=8 stress-test.sh traffic
-  URL=https://web.local/ DL_URL=https://a/1G.bin stress-test.sh mixed
+  URL=http://127.0.0.1/ DUR=60 stress-test.sh baseline
+  DL_URL=https://ash-speed.hetzner.com/1GB.bin DL_WORKERS=4 stress-test.sh traffic
+  URL=http://127.0.0.1/ DL_URL=https://ash-speed.hetzner.com/1GB.bin stress-test.sh mixed
 
 不落地直接跑 (參數要接在 <(...) 之後，環境變數放最前面):
-  URL=https://web.local/ bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) baseline
+  URL=http://127.0.0.1/ bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) baseline
 
 每次執行產生一份報告 logs/<項目>-<時間戳>.log，內容依序寫在同一個檔案裡。
 EOF

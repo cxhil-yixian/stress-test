@@ -193,28 +193,66 @@ yum install -y epel-release && yum install -y wrk    # wrk 不在 base repo
 | `UA` | 自訂 User-Agent（預設 `stress-test/1.0`） | |
 | `INSECURE=1` | 跳過 TLS 驗證（只在測自簽憑證的內部站時用） | |
 
-`DUR` 一樣控制每次測試的秒數。
+`DUR` 一樣控制每次測試的秒數。`URL` 與 `DL_URL` 這兩個角色的性質相反，分開講。
+
+#### `URL`（wrk 目標）—— 只能是你自己的網站
+
+wrk 會產生真實的高併發請求（`-c50` 就是持續壓 50 條連線），**對別人的網站等同一次小型 DoS**。只能填你有權壓測的目標：
+
+```bash
+URL=http://127.0.0.1/            # 這台機器上自己跑的網站，最常見
+URL=http://127.0.0.1:8080/       # 換連接埠
+URL=https://你的正式站/           # 你自己擁有的伺服器
+```
+
+網站是靠網域名分辨 vhost、直接打 IP 會被導到別站時，打 IP 但用 header 假裝帶網域名，不用改 hosts 或 DNS：
+
+```bash
+URL=http://127.0.0.1/ HOST_HEADER=shop.yoursite.com ./stress-test.sh baseline
+```
+
+只是想先確認腳本會動的話，這台機器臨時起一個就好：
+
+```bash
+python3 -m http.server 8080 &                 # 或 yum install -y httpd && systemctl start httpd
+URL=http://127.0.0.1:8080/ DUR=15 ./stress-test.sh baseline
+```
+
+#### `DL_URL`（curl 下載來源）—— 用你控制的，或公開測速檔
+
+這是要下載大檔來灌流量。**最推薦用你自己控制的來源**（自己的物件儲存、另一台機房主機上的大檔），乾淨又不打擾別人。
+
+手邊沒有的話，各大機房有**專門公開給人測頻寬**的測速檔，這類就是設計來被下載的：
+
+| 來源 | 範例 URL |
+|---|---|
+| Hetzner | `https://ash-speed.hetzner.com/1GB.bin` |
+| OVH | `https://proof.ovh.net/files/1Gb.dat` |
+| Cachefly | `https://cachefly.cachefly.net/100mb.test` |
+| Cloudflare | `https://speed.cloudflare.com/__down?bytes=1073741824` |
+
+> ⚠️ **有分寸**：這些是給「跑一兩次測速」用的，不是給你開 8 個 worker 連續灌十分鐘。這個工具會反覆下載直到時間結束，等於持續佔用對方頻寬。正式、長時間的測試請用你自己的檔案來源；拿公開檔只適合驗證工具能動（短時間、`DL_WORKERS` 2~4）。
 
 ### 三個模式
 
 **baseline** —— 只跑 wrk，建立**無干擾基準**。這組 Requests/sec 之後拿來跟 mixed 對照。
 
 ```bash
-URL=https://web.local/ DUR=60 ./stress-test.sh baseline
+URL=http://127.0.0.1/ DUR=60 ./stress-test.sh baseline
 ```
 
 **traffic** —— 只跑多個 curl 下載，拉高接收流量。確認單機可達的接收流量，觀察 CPU 與 TCP。
 
 ```bash
-DL_URL=https://speed.example/1G.bin DL_WORKERS=8 DUR=60 ./stress-test.sh traffic
+DL_URL=https://ash-speed.hetzner.com/1GB.bin DL_WORKERS=4 DUR=60 ./stress-test.sh traffic
 # 多個來源分散壓力：
-DL_URL=https://a/1G.bin,https://b/1G.bin ./stress-test.sh traffic
+DL_URL=https://ash-speed.hetzner.com/1GB.bin,https://proof.ovh.net/files/1Gb.dat ./stress-test.sh traffic
 ```
 
-**mixed** —— 下載流量與網站壓測**同時進行**。模擬主機網路忙碌時仍要提供網站服務，看網站效能相較 baseline 掉了多少。
+**mixed** —— 下載流量與網站壓測**同時進行**。模擬主機網路忙碌時仍要提供網站服務，看網站效能相較 baseline 掉了多少。這裡 `URL` 通常就指向同一台機器上的網站（`127.0.0.1`），因為下載流量跟網站搶的是同一台的 CPU 與網卡。
 
 ```bash
-URL=https://web.local/ DL_URL=https://speed.example/1G.bin DUR=60 ./stress-test.sh mixed
+URL=http://127.0.0.1/ DL_URL=https://ash-speed.hetzner.com/1GB.bin DUR=60 ./stress-test.sh mixed
 ```
 
 ### 怎麼讀

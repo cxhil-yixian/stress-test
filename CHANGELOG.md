@@ -19,6 +19,7 @@
 - 下載內容一律寫 `/dev/null` 不落磁碟；curl worker 反覆下載至時間結束；中斷時所有 worker 與暫存目錄都會收乾淨
 - 相容 CentOS 7 / Bash 4.2：不使用 nameref、關聯陣列、mapfile、非必要的 process substitution
 - `need` 對 `wrk` 給專屬安裝提示（不在 base repo，需 EPEL 或自行編譯）
+- README 與 `usage()` 的網路測試範例改用 `http://127.0.0.1/`，並明確界線：`URL` 只能是你自己的網站（wrk 會產生真實高併發請求，打別人的站等同 DoS）；`DL_URL` 建議用自己的檔案來源，附上公開測速檔（Hetzner / OVH / Cachefly / Cloudflare）供短時間驗證，並提醒別長時間連續灌
 
 ### 新增（報告）
 
