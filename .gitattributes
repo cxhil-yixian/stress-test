@@ -1,0 +1,6 @@
+# shell script 一定要是 LF。帶著 CRLF 跑到 Linux 上，
+# 錯誤訊息會是 "/usr/bin/env: bash\r: No such file or directory"，
+# 很難聯想到是行尾問題。在 Windows 上 clone 也強制 LF。
+*.sh text eol=lf
+
+*.md text
