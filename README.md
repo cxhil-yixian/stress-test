@@ -1,8 +1,13 @@
 # stress-test
 
-針對 CentOS 7.9 / KVM 虛擬機的單檔壓力測試腳本，涵蓋 CPU、記憶體、磁碟、SWAP 與 NTP 時間偏移五個項目。跑測試的同時會在旁邊持續輸出系統監看數據，所有結果都會寫進 `logs/`。
+針對 CentOS 7.9 / KVM 虛擬機的單檔壓力測試腳本。分兩組：
 
-腳本的重點不只是「把機器操滿」，而是**讓數據可信**：磁碟測試會偵測 KVM host cache 汙染、SWAP 測試會先保護 sshd 不被 OOM killer 殺掉、NTP 測試不管怎麼中斷都會把時鐘還原。
+- **本機壓測** —— CPU、記憶體、磁碟、SWAP、NTP 時間偏移
+- **網路測試** —— 主機在扛大量下載流量時，網站是否仍能正常回應（`baseline` / `traffic` / `mixed`）
+
+跑測試的同時會在旁邊持續輸出系統監看數據，每次執行產生一份報告寫進 `logs/`。
+
+腳本的重點不只是「把機器操滿」，而是**讓數據可信**：磁碟測試會偵測 KVM host cache 汙染、SWAP 測試會先保護 sshd 不被 OOM killer 殺掉、NTP 測試不管怎麼中斷都會把時鐘還原、網路測試會把 CPU 峰值跟吞吐擺在一起讓你判斷瓶頸在哪。
 
 ## 一鍵執行
 
@@ -158,6 +163,76 @@ VM 內的讀取數據普遍不可信（guest 的 `direct=1` 繞不過 hypervisor
 必須先停 chronyd，否則兩秒後時間就被拉回，會誤以為沒生效。還原動作掛在 `RETURN` / `INT` / `TERM` trap 上，正常結束或 Ctrl-C 都會還原：先 `date -s "-2 minutes"` 確定性地扣回撥掉的量（不依賴網路，連不到 NTP 來源的機器也還原得了），再由 chronyd `makestep` 修掉殘差。
 
 `all` 不包含此項目，需要時請單獨執行。
+
+## 網路測試（baseline / traffic / mixed）
+
+回答一個問題：**主機正在扛大量對外下載流量時，你的網站還答不答得動？** 用 `wrk` 打網站、`curl` 灌下載流量、監看記錄 CPU / Load / 網卡收發 / TCP 狀態。
+
+> 這不是分散式壓測平台，也取代不了外部壓測機。它量的是「單機在網路忙碌下的自我表現」。
+
+### 需要的工具
+
+```bash
+yum install -y epel-release && yum install -y wrk    # wrk 不在 base repo
+# curl base 就有
+```
+
+`wrk` 在 CentOS 7 的 base repo 裡沒有，要透過 EPEL 或自行編譯（[wg/wrk](https://github.com/wg/wrk)）。缺工具時腳本會告訴你怎麼裝。
+
+### 目標怎麼給
+
+目標網址與下載來源**沒有預設值**，必須自己用環境變數提供 —— 這些是你授權要打的目標，腳本不會（也不該）幫你決定：
+
+| 變數 | 用途 | 哪些模式需要 |
+|---|---|---|
+| `URL` | wrk 壓測的網站 | baseline、mixed |
+| `DL_URL` | curl 下載來源，逗號分隔可多個 | traffic、mixed |
+| `WRK_THREADS` / `WRK_CONNS` | wrk 執行緒數 / 連線數（預設 2 / 50） | |
+| `DL_WORKERS` | 同時幾個 curl 下載程序（預設 4） | |
+| `HOST_HEADER` | 自訂 Host header（打 IP 測特定 vhost 時用） | |
+| `UA` | 自訂 User-Agent（預設 `stress-test/1.0`） | |
+| `INSECURE=1` | 跳過 TLS 驗證（只在測自簽憑證的內部站時用） | |
+
+`DUR` 一樣控制每次測試的秒數。
+
+### 三個模式
+
+**baseline** —— 只跑 wrk，建立**無干擾基準**。這組 Requests/sec 之後拿來跟 mixed 對照。
+
+```bash
+URL=https://web.local/ DUR=60 ./stress-test.sh baseline
+```
+
+**traffic** —— 只跑多個 curl 下載，拉高接收流量。確認單機可達的接收流量，觀察 CPU 與 TCP。
+
+```bash
+DL_URL=https://speed.example/1G.bin DL_WORKERS=8 DUR=60 ./stress-test.sh traffic
+# 多個來源分散壓力：
+DL_URL=https://a/1G.bin,https://b/1G.bin ./stress-test.sh traffic
+```
+
+**mixed** —— 下載流量與網站壓測**同時進行**。模擬主機網路忙碌時仍要提供網站服務，看網站效能相較 baseline 掉了多少。
+
+```bash
+URL=https://web.local/ DL_URL=https://speed.example/1G.bin DUR=60 ./stress-test.sh mixed
+```
+
+### 怎麼讀
+
+報告摘要會給你這幾行：
+
+```
+  網站 Requests/sec 350.00，p99 延遲 310.00ms，傳輸 1.33MB，非 2xx/3xx 5
+  流量 網卡平均接收 480.2MB/s，curl 實際下載 28.1GB
+  系統 CPU 峰值 96%，load 峰值 8.4，接收峰值 512.0MB/s，ESTAB 峰值 210，TIME-WAIT 峰值 45000
+```
+
+- **mixed 的 Requests/sec 要跟單獨 baseline 的數字比** —— 兩者是分開執行的，腳本不會自動對照。掉幅就是流量壓力對網站的衝擊。
+- **接收流量遠低於網卡上限、但 CPU 峰值接近 100%** —— 瓶頸在 CPU（軟中斷 / 單一佇列），不是頻寬。腳本會在 CPU 峰值 ≥95% 時警告。
+- **TIME-WAIT 暴增** —— 短連線可能耗盡來源埠，腳本超過門檻會提示看 `net.ipv4.ip_local_port_range` 與 `tcp_tw_reuse`。
+- 網站在壓力下開始回非 2xx/3xx，或 wrk 出現 socket error，都會升級成警告列進摘要。
+
+下載內容一律寫到 `/dev/null`，不落磁碟。curl worker 反覆下載直到測試時間結束，中斷（Ctrl-C）時所有 worker 與暫存都會收乾淨。
 
 ## 報告
 

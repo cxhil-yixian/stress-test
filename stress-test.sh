@@ -18,7 +18,7 @@ set -uo pipefail
 # 而「參數打錯」正是最需要用法說明的時候。
 usage() {
     cat <<'EOF'
-用法:
+本機壓測:
   stress-test.sh cpu           CPU 壓測
   stress-test.sh ram           記憶體壓測
   stress-test.sh disk          磁碟讀寫
@@ -26,14 +26,32 @@ usage() {
   stress-test.sh ntp           NTP 時間偏移 2 分鐘
   stress-test.sh all           以上全跑 (不含 ntp，時鐘要自己單獨測)
 
-參數:
+網路測試 (主機扛下載流量時網站還答不答得動):
+  stress-test.sh baseline      只跑 wrk，建立網站效能基準           需要 URL
+  stress-test.sh traffic       只跑 curl 多路下載，拉高接收流量      需要 DL_URL
+  stress-test.sh mixed         下載流量 + 網站壓測同時               需要 URL 與 DL_URL
+
+通用參數:
   DUR=60            每項持續秒數
   DISK_DIR=./logs   fio 測試檔位置 (測完自動刪除)
 
-不落地直接跑 (參數要接在 <(...) 之後):
-  bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
+網路測試參數 (URL/DL_URL 沒有預設，必須自己給授權的目標):
+  URL=https://你的網站/            wrk 壓測目標
+  DL_URL=https://來源/big.bin      curl 下載來源，逗號分隔可多個
+  WRK_THREADS=2  WRK_CONNS=50      wrk 執行緒 / 連線數
+  DL_WORKERS=4                     同時幾個 curl 下載程序
+  HOST_HEADER=  UA=stress-test/1.0 自訂 Host / User-Agent
+  INSECURE=1                       跳過 TLS 驗證 (測自簽憑證的內部站才用)
 
-每次執行產生一份報告 logs/<項目>-<時間戳>.log，五項依序寫在同一個檔案裡。
+範例:
+  URL=https://web.local/ DUR=60 stress-test.sh baseline
+  DL_URL=https://a/1G.bin,https://b/1G.bin DL_WORKERS=8 stress-test.sh traffic
+  URL=https://web.local/ DL_URL=https://a/1G.bin stress-test.sh mixed
+
+不落地直接跑 (參數要接在 <(...) 之後，環境變數放最前面):
+  URL=https://web.local/ bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) baseline
+
+每次執行產生一份報告 logs/<項目>-<時間戳>.log，內容依序寫在同一個檔案裡。
 EOF
     echo "這次的輸出會寫到: ${LOGDIR:-<尚未建立>}"
 }
@@ -45,6 +63,26 @@ DUR="${DUR:-60}"
 # DUR 會進到算術展開跟 fio --runtime，非數字的話錯誤訊息會很難懂，先擋掉
 case "$DUR" in ''|*[!0-9]*) echo "DUR 要是正整數，收到: $DUR"; exit 2 ;; esac
 [ "$DUR" -ge 1 ] || { echo "DUR 要 >= 1"; exit 2; }
+
+# ---------- 網路測試參數 (baseline / traffic / mixed 用) ----------
+# URL / DL_URL 沒有預設值，因為它們是「你授權的目標」，寫死等於幫使用者決定
+# 要打誰 -- 絕對不行。缺的時候由主流程按模式各自要求。
+URL="${URL:-}"                      # wrk 壓測的網站 (baseline/mixed 必填)
+DL_URL="${DL_URL:-}"                # curl 下載來源，逗號分隔多個 (traffic/mixed 必填)
+WRK_THREADS="${WRK_THREADS:-2}"     # wrk -t
+WRK_CONNS="${WRK_CONNS:-50}"        # wrk -c
+DL_WORKERS="${DL_WORKERS:-4}"       # 同時幾個 curl 下載程序
+HOST_HEADER="${HOST_HEADER:-}"      # 自訂 Host header (打 IP 測特定 vhost 時用)
+UA="${UA:-stress-test/1.0}"         # 自訂 User-Agent
+INSECURE="${INSECURE:-0}"           # =1 時跳過 TLS 驗證 (curl -k / wrk 本來就不驗)
+for _v in WRK_THREADS WRK_CONNS DL_WORKERS; do
+    eval "_val=\$$_v"
+    case "$_val" in ''|*[!0-9]*) echo "$_v 要是正整數，收到: $_val"; exit 2 ;; esac
+    [ "$_val" -ge 1 ] || { echo "$_v 要 >= 1"; exit 2; }
+done
+# INSECURE 統一收斂成 curl 要不要加 -k。只有明確 =1 才關驗證，
+# 寫成 ${INSECURE:+-k} 會連 INSECURE=0 都觸發 (非空即展開)，這是常見的坑。
+CURL_K=""; [ "$INSECURE" = "1" ] && CURL_K="-k"
 
 # 相對於 CWD 建立，再轉成絕對路徑存起來。
 # 轉絕對路徑有兩個好處：報告裡印出的路徑不會有「這是相對誰」的疑問，
@@ -69,20 +107,36 @@ LOG=""
 FIO_FILE=""
 # t_swap 動過的 sshd oom_score_adj，格式 "pid:原值 pid:原值"
 OOM_SAVED=""
+# 網路測試的暫存：curl worker 的 PID 清單 + 一個放監看統計/下載計數的暫存目錄，
+# 中斷時要收乾淨。
+DL_PIDS=""
+NET_TMP=""
 
 # ---------- 摘要用的全域 ----------
-# 每個 t_* 跑完自己填。沒跑到的維持「未執行」，摘要才會永遠列滿五項，
+# SUITE 決定摘要長哪一套：local (cpu/ram/disk/swap/ntp) 或 net (baseline/traffic/mixed)。
+# 兩套的判讀完全不同，硬塞在一起只會互相干擾。
+SUITE="local"
+
+# 本機壓測。每個 t_* 跑完自己填。沒跑到的維持「未執行」，摘要才會永遠列滿五項，
 # 讓人一眼看出「這項沒測」而不是「這項沒問題」-- 兩者差很多。
 SUM_CPU="未執行"
 SUM_RAM="未執行"
 SUM_DISK="未執行"
 SUM_SWAP="未執行"
 SUM_NTP="未執行 (需單獨執行 ntp)"
+
+# 網路測試。依模式填其中幾項。
+SUM_WRK="未執行"      # wrk 網站壓測結果 (baseline/mixed)
+SUM_DL="未執行"       # curl 下載流量結果 (traffic/mixed)
+SUM_SYS="未取得"      # 監看撈到的系統峰值 (CPU/load/TCP)
+
 WARNINGS=""
 
-# 腳本被 Ctrl-C / kill 時：收掉背景監看 + 還原 oom_score_adj + 清掉測試檔，
+# 腳本被 Ctrl-C / kill 時：收掉背景監看 + curl workers + 還原 oom_score_adj + 清測試檔，
 # 然後把已經跑完的部分做成摘要 -- 中斷不該讓前面的結果白跑
-trap 'mon_stop 2>/dev/null; oom_restore 2>/dev/null; [ -n "$FIO_FILE" ] && rm -f "$FIO_FILE"
+trap 'mon_stop 2>/dev/null; [ -n "$DL_PIDS" ] && kill $DL_PIDS 2>/dev/null
+      oom_restore 2>/dev/null
+      [ -n "$FIO_FILE" ] && rm -f "$FIO_FILE"; [ -n "$NET_TMP" ] && rm -rf "$NET_TMP"
       echo; echo "已中斷，已清理"; [ -n "$LOG" ] && report_summary "已中斷"; exit 130' INT TERM
 
 # 掃掉上次沒清乾淨的殘骸 (例如被 kill -9)
@@ -101,11 +155,19 @@ _scan_stale "$LOGDIR"
 
 # 缺工具時給明確訊息，而不是讓它噴 command not found
 need() {
-    local miss=""
+    local miss="" t
     for t in "$@"; do command -v "$t" >/dev/null 2>&1 || miss="$miss $t"; done
     [ -z "$miss" ] && return 0
     log "缺少工具:$miss"
-    log "  yum install -y fio sysstat stress-ng chrony"
+    case "$miss" in
+        # wrk 不在 CentOS 7 base repo，要自己編或裝 EPEL 版，訊息裡講清楚
+        *wrk*) log "  wrk 需自行安裝: yum install -y epel-release && yum install -y wrk"
+               log "         或從原始碼編譯 https://github.com/wg/wrk" ;;
+    esac
+    case "$miss" in
+        *fio*|*stress-ng*|*mpstat*|*vmstat*|*chronyc*)
+            log "  yum install -y fio sysstat stress-ng chrony" ;;
+    esac
     return 1
 }
 
@@ -157,7 +219,15 @@ report_head() {
       echo "  每項持續      ${DUR} s"
       echo "  開始時間      $(date '+%F %T %Z')"
       echo "  報告位置      $LOG"
-      echo "  fio 測試檔    $DISK_DIR"
+      if [ "$SUITE" = "net" ]; then
+          [ -n "$URL" ]    && echo "  壓測目標      $URL"
+          [ -n "$DL_URL" ] && echo "  下載來源      $DL_URL"
+          echo "  wrk           ${WRK_THREADS} 執行緒 / ${WRK_CONNS} 連線"
+          echo "  下載程序      ${DL_WORKERS} 個 curl worker"
+          [ "$INSECURE" = "1" ] && echo "  TLS 驗證      關閉 (INSECURE=1)"
+      else
+          echo "  fio 測試檔    $DISK_DIR"
+      fi
     } | tee "$LOG"
 }
 
@@ -170,6 +240,7 @@ sum_row() {
     done <<< "$2"
 }
 
+# 兩套摘要的共通框架：標頭、警告區、收尾。中間的資料列與判讀提示由 SUITE 決定。
 report_summary() {
     { echo
       echo
@@ -177,11 +248,20 @@ report_summary() {
       echo "  摘要${1:+  ($1)}"
       echo "$RULE"
       echo
-      sum_row "CPU"  "$SUM_CPU"
-      sum_row "RAM"  "$SUM_RAM"
-      sum_row "DISK" "$SUM_DISK"
-      sum_row "SWAP" "$SUM_SWAP"
-      sum_row "NTP"  "$SUM_NTP"
+      if [ "$SUITE" = "net" ]; then
+          [ -n "$URL" ]    && sum_row "目標" "$URL"
+          [ -n "$DL_URL" ] && sum_row "下載" "$DL_URL"
+          echo
+          sum_row "網站" "$SUM_WRK"
+          sum_row "流量" "$SUM_DL"
+          sum_row "系統" "$SUM_SYS"
+      else
+          sum_row "CPU"  "$SUM_CPU"
+          sum_row "RAM"  "$SUM_RAM"
+          sum_row "DISK" "$SUM_DISK"
+          sum_row "SWAP" "$SUM_SWAP"
+          sum_row "NTP"  "$SUM_NTP"
+      fi
       echo
       if [ -n "$WARNINGS" ]; then
           echo "$THIN"
@@ -193,11 +273,20 @@ report_summary() {
       echo "$THIN"
       echo "  判讀提示"
       echo "$THIN"
-      echo "  * steal 持續 >0 代表 CPU 被 hypervisor 拿去給別的 VM，"
-      echo "    此時 bogo ops 低是 host 超賣，不是這台機器的問題。"
-      echo "  * VM 內的磁碟「讀取」數據普遍不可信 -- guest 的 direct=1 繞不過"
-      echo "    hypervisor 的 cache。以「寫入的 p99 尾端延遲」為準。"
-      echo "  * 平均延遲會把快慢兩群混在一起。p99 才是你的服務真正會遇到的。"
+      if [ "$SUITE" = "net" ]; then
+          echo "  * mixed 的 Requests/sec 要跟「單獨 baseline」的數字比，才看得出"
+          echo "    下載流量壓力下網站掉了多少。兩者是分開執行的，請自行對照。"
+          echo "  * 接收流量遠低於網卡上限時，瓶頸多半在 CPU (軟中斷/單一佇列) 或"
+          echo "    下載來源端，不是本機頻寬。看系統列的 CPU 峰值。"
+          echo "  * TIME-WAIT 隨短連線暴增，可能耗盡來源埠；ESTAB 停滯代表連線"
+          echo "    建立受限。網站延遲飆高時先看這兩個數字。"
+      else
+          echo "  * steal 持續 >0 代表 CPU 被 hypervisor 拿去給別的 VM，"
+          echo "    此時 bogo ops 低是 host 超賣，不是這台機器的問題。"
+          echo "  * VM 內的磁碟「讀取」數據普遍不可信 -- guest 的 direct=1 繞不過"
+          echo "    hypervisor 的 cache。以「寫入的 p99 尾端延遲」為準。"
+          echo "  * 平均延遲會把快慢兩群混在一起。p99 才是你的服務真正會遇到的。"
+      fi
       echo
       echo "  結束時間      $(date '+%F %T %Z')"
       echo "  完整報告      $LOG"
@@ -555,12 +644,251 @@ t_ntp() {
     # trap RETURN 會自動呼叫 restore_ntp
 }
 
+# ==================================================================
+#  網路測試 (baseline / traffic / mixed)
+# ==================================================================
+# 這一組跟本機壓測是不同世界：目標是「主機在扛大量下載流量時，網站還答不答
+# 得動」。wrk 打網站、curl 灌下載流量、監看記 CPU/網卡/TCP。
+
+# 逗號分隔的 URL 清單 -> 陣列 _CSV。前後空白會 trim 掉，允許 "a, b" 這種寫法。
+# 不用 mapfile (spec 要求相容 bash 4.2 且避免進階用法)。
+_split_csv() {
+    local IFS=',' raw part
+    _CSV=()
+    read -ra raw <<< "$1"
+    for part in "${raw[@]}"; do
+        part="${part#"${part%%[![:space:]]*}"}"    # 去頭部空白
+        part="${part%"${part##*[![:space:]]}"}"    # 去尾部空白
+        [ -n "$part" ] && _CSV+=("$part")
+    done
+}
+
+# 全網卡 (排除 lo) 的累計收發位元組。/proc/net/dev 的 "eth0:12345" 冒號可能黏著
+# 數字，先把冒號換成空白再切欄。$2=接收位元組，$10=傳送位元組。
+# 一定要「永遠輸出兩個數字」-- 呼叫端是 set -- $(_nic_bytes)，空輸出會讓 set -u 炸掉。
+_nic_bytes() {
+    [ -r /proc/net/dev ] || { echo "0 0"; return; }
+    awk '{sub(/:/," ")} NR>2 && $1!="lo" {rx+=$2; tx+=$10} END{print rx+0, tx+0}' /proc/net/dev
+}
+# /proc/stat 第一行的 CPU 累計時間 -> "總計 閒置"，兩次相減就是這段區間的忙碌比。
+_cpu_snap() {
+    [ -r /proc/stat ] || { echo "0 0"; return; }
+    awk '/^cpu /{idle=$5+$6; t=0; for(i=2;i<=NF;i++) t+=$i; print t, idle; exit}' /proc/stat
+}
+# bytes/s -> 人看得懂的單位
+_hr() {
+    awk -v b="${1:-0}" 'BEGIN{ if(b<0)b=0
+        if(b>=1048576) printf "%.1fMB/s",b/1048576
+        else if(b>=1024) printf "%.0fKB/s",b/1024
+        else printf "%dB/s",b }'
+}
+# 累計 bytes -> 人看得懂的單位 (不是速率)
+_hb() {
+    awk -v b="${1:-0}" 'BEGIN{ if(b<0)b=0
+        if(b>=1073741824) printf "%.2fGB",b/1073741824
+        else if(b>=1048576) printf "%.1fMB",b/1048576
+        else printf "%.0fKB",b/1024 }'
+}
+
+# 網路監看：每 3 秒印一行 CPU/load/可用記憶體/網卡收發/TCP 狀態，
+# 同時把原始數字 (drx dtx busy estab tw load) 寫進 $NET_TMP/mon 供事後算峰值。
+# 跟 _mon_cpu 一樣，一定要整行組好再印，避免跟 wrk 的輸出交錯。
+_mon_net() {
+    local prx ptx pt pi nrx ntx nt ni drx dtx busy estab tw load mem
+    set -- $(_nic_bytes); prx=$1; ptx=$2
+    set -- $(_cpu_snap);  pt=$1; pi=$2
+    while :; do
+        sleep 3
+        set -- $(_nic_bytes); nrx=$1; ntx=$2
+        set -- $(_cpu_snap);  nt=$1; ni=$2
+        drx=$(( (nrx - prx) / 3 )); dtx=$(( (ntx - ptx) / 3 ))
+        busy=$(awk -v a="$pt" -v b="$pi" -v c="$nt" -v d="$ni" \
+               'BEGIN{dt=c-a; di=d-b; if(dt>0) printf "%.0f",(dt-di)*100/dt; else print 0}')
+        prx=$nrx; ptx=$ntx; pt=$nt; pi=$ni
+        load=$(cut -d' ' -f1 /proc/loadavg)
+        mem=$(awk '/MemAvailable/{printf "%d",$2/1024; f=1} END{if(!f) print 0}' /proc/meminfo)
+        # ss -tan 第一欄是連線狀態；END 一定會跑，所以 ss 不存在時也是印 "0 0"
+        set -- $(ss -tan 2>/dev/null | awk 'NR>1{s[$1]++} END{print s["ESTAB"]+0, s["TIME-WAIT"]+0}')
+        estab=${1:-0}; tw=${2:-0}
+        printf '  %s  cpu=%s%% load=%s  avail=%sMB  rx=%s tx=%s  ESTAB=%s TW=%s\n' \
+            "$(date +%H:%M:%S)" "$busy" "$load" "$mem" "$(_hr "$drx")" "$(_hr "$dtx")" "$estab" "$tw" \
+            | tee -a "$LOG"
+        echo "$drx $dtx $busy $estab $tw $load" >> "$NET_TMP/mon"
+    done
+}
+# _mon_peak <欄號> max|avg -- 從 $NET_TMP/mon 撈某欄的峰值或平均
+_mon_peak() {
+    [ -s "$NET_TMP/mon" ] || { echo 0; return; }
+    awk -v f="$1" -v m="$2" '{v=$f+0; if(m=="max"){if(v>x)x=v} else {s+=v;n++}}
+        END{ if(m=="max") print x+0; else printf "%.0f", (n? s/n:0) }' "$NET_TMP/mon"
+}
+
+# 單一 curl 下載程序：反覆下載到 /dev/null 直到 deadline，累計下載位元組寫進 sf。
+# 每輪覆寫 sf (而非 append)，被 kill 也留得住最後一次的累計值。
+_dl_worker() {
+    local n="$1" deadline="$2" sf="$3"; shift 3
+    local urls=("$@") i=0 total=0 got
+    echo 0 > "$sf"
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        got=$(curl --location --silent --show-error --connect-timeout 10 --max-time 30 \
+                   $CURL_K --output /dev/null --write-out '%{size_download}' \
+                   "${urls[$(( i % ${#urls[@]} ))]}" 2>/dev/null) || got=0
+        case "$got" in ''|*[!0-9]*) got=0 ;; esac
+        total=$(( total + got )); i=$(( i + 1 ))
+        echo "$total" > "$sf"
+    done
+}
+# 起 DL_WORKERS 個下載程序 (背景)，deadline = 現在 + dur。回傳後 workers 仍在跑。
+_dl_start() {
+    local dur="$1" deadline w
+    _split_csv "$DL_URL"
+    [ "${#_CSV[@]}" -ge 1 ] || { warn "DL_URL 解析後沒有有效來源"; return 1; }
+    deadline=$(( $(date +%s) + dur ))
+    DL_PIDS=""
+    for w in $(seq 1 "$DL_WORKERS"); do
+        _dl_worker "$w" "$deadline" "$NET_TMP/dl.$w" "${_CSV[@]}" &
+        DL_PIDS="$DL_PIDS $!"
+    done
+    log "已啟動 ${DL_WORKERS} 個 curl 下載程序 (來源 ${#_CSV[@]} 個)"
+}
+# 等所有下載程序自然結束 (它們會在 deadline 自己停，最後一輪 curl 受 --max-time 30 上限)
+_dl_stop() {
+    local p
+    for p in $DL_PIDS; do wait "$p" 2>/dev/null; done
+    DL_PIDS=""
+}
+# 加總所有 worker 的下載位元組
+_dl_bytes() {
+    local sum=0 f v
+    for f in "$NET_TMP"/dl.*; do
+        [ -e "$f" ] || continue
+        v=$(cat "$f" 2>/dev/null); case "$v" in ''|*[!0-9]*) v=0 ;; esac
+        sum=$(( sum + v ))
+    done
+    echo "$sum"
+}
+
+# 收尾：算網卡平均接收 (存進 NET_AVG_RX) 與系統峰值 (填 SUM_SYS)，順便觸發警告。
+NET_AVG_RX=0
+_net_finish() {
+    local rxs="$1" t0="$2" rxe secs pkrx pkcpu pkload pkestab pktw
+    set -- $(_nic_bytes); rxe=$1
+    secs=$(( $(date +%s) - t0 )); [ "$secs" -lt 1 ] && secs=1
+    NET_AVG_RX=$(( (rxe - rxs) / secs ))
+    pkrx=$(_mon_peak 1 max); pkcpu=$(_mon_peak 3 max); pkload=$(_mon_peak 6 max)
+    pkestab=$(_mon_peak 4 max); pktw=$(_mon_peak 5 max)
+    SUM_SYS="CPU 峰值 ${pkcpu}%，load 峰值 ${pkload}，接收峰值 $(_hr "$pkrx")，ESTAB 峰值 ${pkestab}，TIME-WAIT 峰值 ${pktw}"
+    [ "$pkcpu" -ge 95 ] 2>/dev/null && \
+        warn "CPU 忙碌峰值 ${pkcpu}% -> 網路吞吐可能卡在 CPU (軟中斷/單一佇列)，不是頻寬"
+    [ "$pktw" -gt 20000 ] 2>/dev/null && \
+        warn "TIME-WAIT 峰值 ${pktw} -> 短連線恐耗盡來源埠，看 net.ipv4.ip_local_port_range / tcp_tw_reuse"
+}
+
+# 跑一輪 wrk 並解析結果，填 SUM_WRK。
+_wrk_run() {
+    local dur="$1" out rps p99 nonx serr xfer
+    local args=(-t"$WRK_THREADS" -c"$WRK_CONNS" -d"${dur}s" --latency -H "User-Agent: $UA")
+    [ -n "$HOST_HEADER" ] && args+=(-H "Host: $HOST_HEADER")
+    log "wrk -t${WRK_THREADS} -c${WRK_CONNS} -d${dur}s --latency $URL"
+    out=$(wrk "${args[@]}" "$URL" 2>&1)
+    printf '%s\n' "$out" | sed 's/^/  /' | tee -a "$LOG"
+
+    rps=$(printf '%s\n'  "$out" | awk '/^Requests\/sec/{print $2}')
+    xfer=$(printf '%s\n' "$out" | awk '/^Transfer\/sec/{print $2}')
+    p99=$(printf '%s\n'  "$out" | awk '/Latency Distribution/{f=1} f&&/99%/{print $2; exit}')
+    nonx=$(printf '%s\n' "$out" | awk '/Non-2xx or 3xx/{print $NF}')
+    serr=$(printf '%s\n' "$out" | grep 'Socket errors' | sed 's/^ *//')
+
+    SUM_WRK="Requests/sec ${rps:-?}，p99 延遲 ${p99:-?}，傳輸 ${xfer:-?}"
+    [ -n "$nonx" ] && SUM_WRK="${SUM_WRK}，非 2xx/3xx ${nonx}"
+    if [ -n "$nonx" ] && [ "$nonx" -gt 0 ] 2>/dev/null; then
+        warn "wrk 收到 ${nonx} 個非 2xx/3xx 回應 -> 網站在壓力下開始回錯誤"
+    fi
+    [ -n "$serr" ] && warn "wrk $serr"
+    [ -z "$rps" ] && warn "wrk 沒解析到 Requests/sec -> 可能連線失敗或 URL 打不通 (詳見上方本文)"
+}
+
+# 建立網路測試的暫存目錄。只負責 mktemp -- RETURN 清理必須由呼叫端的
+# t_* 自己掛，因為 RETURN trap 是「誰返回誰觸發」：掛在這裡的話，_net_setup
+# 一 return 就把剛建好的目錄刪了。這正是 t_disk/t_swap 把 trap 寫在自己
+# 函式裡而不是抽出來的原因。
+_net_setup() {
+    NET_TMP=$(mktemp -d "${TMPDIR:-/tmp}/st-net.XXXXXX") || { log "無法建立暫存目錄"; return 1; }
+}
+# 統一的網路測試清理 trap 內容。t_* 用 trap "$NET_CLEANUP" RETURN 掛上。
+# 正常返回收乾淨；中斷走頂層 INT/TERM (同樣清 DL_PIDS 與 NET_TMP)。
+NET_CLEANUP='kill $DL_PIDS 2>/dev/null; DL_PIDS=""; rm -rf "$NET_TMP"; NET_TMP=""'
+
+# ---------- baseline: 只跑 wrk，建立無干擾基準 ----------
+t_baseline() {
+    sec "1/1" "BASELINE  (wrk 網站基準，無下載干擾)"
+    need wrk || { SUM_WRK="跳過 (缺工具)"; return 1; }
+    _net_setup || { SUM_WRK="跳過 (暫存目錄建立失敗)"; return 1; }
+    trap "$NET_CLEANUP" RETURN
+    local rxs t0
+    log "建立網站效能基準 -- 這組數字之後拿來跟 mixed 對照"
+    set -- $(_nic_bytes); rxs=$1; t0=$(date +%s)
+    mon_start _mon_net
+    _wrk_run "$DUR"
+    mon_stop
+    _net_finish "$rxs" "$t0"
+}
+
+# ---------- traffic: 只跑 curl 下載，拉高接收流量 ----------
+t_traffic() {
+    sec "1/1" "TRAFFIC  (curl 下載流量)"
+    need curl || { SUM_DL="跳過 (缺工具)"; return 1; }
+    _net_setup || { SUM_DL="跳過 (暫存目錄建立失敗)"; return 1; }
+    trap "$NET_CLEANUP" RETURN
+    local rxs t0 bytes
+    log "拉高下載流量 ${DUR}s，觀察單機可達的接收流量與 CPU/TCP"
+    set -- $(_nic_bytes); rxs=$1; t0=$(date +%s)
+    mon_start _mon_net
+    _dl_start "$DUR" || { mon_stop; SUM_DL="失敗 (下載程序沒起來)"; return 1; }
+    sleep "$DUR"
+    _dl_stop
+    mon_stop
+    _net_finish "$rxs" "$t0"
+    bytes=$(_dl_bytes)
+    SUM_DL="網卡平均接收 $(_hr "$NET_AVG_RX")，curl 實際下載 $(_hb "$bytes") (${DL_WORKERS} workers)"
+}
+
+# ---------- mixed: 下載流量 + 網站壓測同時 ----------
+t_mixed() {
+    sec "1/1" "MIXED  (下載流量 + 網站壓測同時進行)"
+    need wrk curl || { SUM_WRK="跳過 (缺工具)"; SUM_DL="跳過 (缺工具)"; return 1; }
+    _net_setup || { SUM_WRK="跳過 (暫存目錄建立失敗)"; SUM_DL="跳過"; return 1; }
+    trap "$NET_CLEANUP" RETURN
+    local rxs t0 bytes
+    log "先起下載流量，再壓網站，兩者同時進行 ${DUR}s"
+    log "把這裡的 Requests/sec 跟單獨 baseline 的數字比，就是流量壓力下的掉幅"
+    set -- $(_nic_bytes); rxs=$1; t0=$(date +%s)
+    mon_start _mon_net
+    _dl_start "$DUR" || log "下載程序沒起來，改成純 wrk"
+    _wrk_run "$DUR"      # 前景跑 DUR 秒，期間 curl 在背景同時灌下載流量
+    _dl_stop
+    mon_stop
+    _net_finish "$rxs" "$t0"
+    bytes=$(_dl_bytes)
+    SUM_DL="網卡平均接收 $(_hr "$NET_AVG_RX")，curl 實際下載 $(_hb "$bytes")"
+}
+
 # ---------- 主 ----------
 # 先驗參數再決定報告檔名，打錯字不該留下一個空報告
 case "${1:-}" in
-    cpu|ram|disk|swap|ntp|all) CMD="$1" ;;
+    cpu|ram|disk|swap|ntp|all) CMD="$1"; SUITE="local" ;;
+    baseline|traffic|mixed)    CMD="$1"; SUITE="net" ;;
     *) usage; exit 2 ;;
 esac
+
+# 網路模式的目標是必填 -- 缺了就明講缺哪個環境變數，不要跑到報告開頭才失敗
+if [ "$SUITE" = "net" ]; then
+    case "$CMD" in
+        baseline) [ -n "$URL" ] || { echo "baseline 需要 URL，例: URL=https://你的網站/ ... baseline"; exit 2; } ;;
+        traffic)  [ -n "$DL_URL" ] || { echo "traffic 需要 DL_URL，例: DL_URL=https://授權來源/big.bin ... traffic"; exit 2; } ;;
+        mixed)    { [ -n "$URL" ] && [ -n "$DL_URL" ]; } || { echo "mixed 需要 URL 與 DL_URL 兩者"; exit 2; } ;;
+    esac
+fi
 
 LOG="$LOGDIR/$CMD-$TS.log"
 report_head "$CMD"
@@ -574,6 +902,9 @@ case "$CMD" in
     # 順序固定 CPU -> RAM -> DISK -> SWAP。ntp 不含在內：時鐘是全機共用的狀態，
     # 順手跑掉風險太高，要測就自己單獨跑。
     all)   t_cpu; t_ram; t_disk; t_swap ;;
+    baseline) t_baseline ;;
+    traffic)  t_traffic ;;
+    mixed)    t_mixed ;;
 esac
 
 report_summary

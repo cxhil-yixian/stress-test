@@ -6,6 +6,20 @@
 
 ## [未發布]
 
+### 新增（網路測試）
+
+- **三個網路測試模式 `baseline` / `traffic` / `mixed`**，回答「主機扛大量下載流量時網站還答不答得動」：
+  - `baseline` —— 只跑 `wrk`，建立網站效能基準
+  - `traffic` —— 只跑多個 `curl` 下載程序拉高接收流量
+  - `mixed` —— 下載流量與網站壓測同時進行，看網站相較 baseline 的掉幅
+- 網路監看 `_mon_net`：每 3 秒記錄 CPU 忙碌率（由 `/proc/stat` 前後差算得）、Load、可用記憶體、網卡收發速率（`/proc/net/dev` 差分）、TCP `ESTAB` / `TIME-WAIT` 數（`ss -tan`）
+- 摘要依 `SUITE` 分兩套：本機壓測維持 CPU/RAM/DISK/SWAP/NTP，網路測試改列「目標 / 下載 / 網站 / 流量 / 系統」與網路專屬判讀提示
+- 自動警告：CPU 忙碌峰值 ≥95%（吞吐卡在 CPU 而非頻寬）、TIME-WAIT 峰值超過門檻（來源埠恐耗盡）、wrk 出現非 2xx/3xx 或 socket error
+- 目標網址與下載來源透過環境變數 `URL` / `DL_URL` 提供（無預設值，必填才跑），另有 `WRK_THREADS` / `WRK_CONNS` / `DL_WORKERS` / `HOST_HEADER` / `UA` / `INSECURE`
+- 下載內容一律寫 `/dev/null` 不落磁碟；curl worker 反覆下載至時間結束；中斷時所有 worker 與暫存目錄都會收乾淨
+- 相容 CentOS 7 / Bash 4.2：不使用 nameref、關聯陣列、mapfile、非必要的 process substitution
+- `need` 對 `wrk` 給專屬安裝提示（不在 base repo，需 EPEL 或自行編譯）
+
 ### 新增（報告）
 
 - **每次執行只產生一份報告**，五個項目依 CPU → RAM → DISK → SWAP → NTP 的固定順序寫在同一個檔案裡。舊版每個項目各寫一個檔案，`cat swap-*.log` 只看得到 swap，得自己拼四個檔案

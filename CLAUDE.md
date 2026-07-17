@@ -79,6 +79,20 @@ shellcheck stress-test.sh   # 若可用
 
    異常用 `warn` 而不是 `log` —— 它會同時進本文與摘要的警告區。`all` 的本文有數百行，只寫在本文裡等於沒寫。
 
+10. **兩套測試由 `SUITE` 區分。** `local`（cpu/ram/disk/swap/ntp/all）與 `net`（baseline/traffic/mixed）的摘要與判讀提示完全不同，`report_head` / `report_summary` 依 `SUITE` 分支。加新模式時記得設對 `SUITE`。
+
+11. **`RETURN` trap 是「誰返回誰觸發」，不能抽進 helper。** 網路測試曾把 `mktemp` + 清理 trap 一起包進 `_net_setup`，結果 `_net_setup` 一 return 就把剛建好的暫存目錄刪了（trap 在 `_net_setup` 的返回點觸發，不是呼叫端的）。所以 `_net_setup` 只 `mktemp`，清理 trap 由每個 `t_*` 自己 `trap "$NET_CLEANUP" RETURN` 掛上 —— 跟 `t_disk`/`t_swap` 把 trap 寫在自己函式裡是同個道理。
+
+12. **監看讀 `/proc` 的函式一定要「永遠輸出固定欄數」。** 呼叫端是 `set -- $(_nic_bytes)`，空輸出在 `set -u` 下會炸。`_nic_bytes` / `_cpu_snap` 在檔案不存在時回退 `echo "0 0"`，`awk` 解析 `/proc/meminfo` 也用 `END{if(!f) print 0}` 兜底。
+
+### 網路測試 (baseline/traffic/mixed) 專屬
+
+- **目標網址／下載來源絕不寫死。** `URL` / `DL_URL` 是使用者授權的目標，只能由環境變數提供，缺了就在報告開始前擋下並明講缺哪個。
+- **`INSECURE` 要比對值，不能用 `${INSECURE:+-k}`。** 後者連 `INSECURE=0` 都會展開（非空即觸發），這是常見的坑。腳本先收斂成 `CURL_K`（只有 `=1` 才是 `-k`）。
+- **下載只寫 `/dev/null`，永遠不落磁碟。** curl worker 反覆下載至 deadline，每輪把累計位元組覆寫進自己的計數檔（被 kill 也留得住最後一次）。
+- **相容 bash 4.2**：不用 nameref / 關聯陣列 / mapfile；`for w in $(seq 1 "$N")` 而非 `{1..$N}`（brace 不吃變數）。
+- **中斷清理**：頂層 `INT`/`TERM` trap 會 `kill $DL_PIDS` 並移除 `NET_TMP`；`DL_PIDS` 是所有 curl worker 的 PID 清單。
+
 ## 驗證跑法
 
 改動後至少要確認三種跑法都正常，特別是 `usage()` 相關的改動：
