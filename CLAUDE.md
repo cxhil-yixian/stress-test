@@ -61,7 +61,11 @@ shellcheck stress-test.sh   # 若可用
 
    解析 fio 輸出時記得它會依數值大小自己挑單位與小數位（`BW=48.0MiB/s`、`BW=3054MiB/s`、`BW=11.7GiB/s`），必須連單位一起處理。曾經因為只比對整數 MiB/s，導致高速（fio 改印 GiB/s）時警告完全不觸發 —— 剛好是最需要它的場合。**靜靜不觸發的檢查比沒有檢查更糟。**
 
-7. **`%steal` 是 KVM guest 的核心指標**，不要為了精簡輸出把它拿掉。mpstat 的欄位順序跨版本會變，所以 `_mon_cpu` 從表頭找欄號，找不到才退回寫死的位置。
+7. **`%steal` 是 KVM guest 的核心指標**，不要為了精簡輸出把它拿掉。
+
+   解析 mpstat 時**絕對不要拿表頭的欄號去索引資料行** —— 兩者欄數不同。CentOS 7 預設 `en_US.UTF-8`，mpstat 印 12 小時制，表頭是 `02:57:18 PM  CPU  %usr ...`（前面兩欄），而 `Average:  all  99.75 ...` 只有一欄，整排差一格。曾經因此讓四個數字全錯：`usr` 讀成 `%nice`、`steal` 讀成 `%guest`、`idle` 指向不存在的欄位。正解是以資料行自己的 `all` 欄為基準往後數（順序 usr nice sys iowait irq soft steal guest gnice idle 跨版本固定，新欄位往後加，故 idle 取 `$NF`），並用 `LC_ALL=C` 固定關鍵字。
+
+   這個教訓跟第 6 點是同一個：**錯得很安靜的東西最危險**。四個 `0.00%` 看起來完全正常，是「4 核滿載卻 usr=0%」這個物理上的矛盾才露出馬腳。改動任何解析邏輯後，要問自己「如果它壞了，我看得出來嗎？」
 
 8. **新增測試項目時的模式：**
    `need <工具...> || return 1` → `head_ <名稱>` → `log` 說明參數 → `mon_start _mon_xxx` → 主壓測（`2>&1 | tee -a "$LOG"`）→ `mon_stop` → `log "完成 -> $LOG"`。同時更新 `usage()` 裡的 here-doc 與 `case` 分支。
@@ -78,6 +82,17 @@ cat stress-test.sh | bash -s --        # stdin
 ```
 
 後兩者是實際最常見的用法，也是最容易壞掉而沒人發現的。非 root 會卡在權限檢查，把那行暫時改成恆真即可測到 `usage()`。
+
+改動輸出解析（mpstat / vmstat / fio）時，**用假的輸入餵給 awk 直接驗證**，不要只看它「有沒有印出東西」：
+
+```bash
+printf '%s\n' \
+  '02:57:18 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle' \
+  'Average:     all   99.75    0.00    0.25    0.00    0.00    0.00    3.50    0.00    0.00    0.00' \
+  | awk '<你的解析>'
+```
+
+至少要涵蓋：12 小時制（含 AM/PM）與 24 小時制的表頭、有無 `%guest`/`%gnice` 的新舊 sysstat。這幾個變體正是踩過坑的地方。
 
 ## 文件同步
 

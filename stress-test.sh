@@ -92,7 +92,9 @@ need() {
     return 1
 }
 
-log()  { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
+# LOG 要到 head_ 才建立。中斷 trap 可能在那之前就呼叫到 log()，
+# 這時 set -u 會讓整個 trap 炸掉，所以給個預設值。
+log()  { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${LOG:-/dev/null}"; }
 head_() { LOG="$LOGDIR/$1-$TS.log"; echo "=== $1 壓測 / $(date) / ${DUR}s ===" | tee "$LOG"; }
 
 # ---------- 背景監看 ----------
@@ -143,12 +145,15 @@ mon_stop() {
 # 這台機器之後就再也不會 OOM 掉 sshd 了，跟系統預期行為不符。
 oom_restore() {
     [ -n "$OOM_SAVED" ] || return 0
-    local e p old
+    local e p old n=0
     for e in $OOM_SAVED; do
         p="${e%%:*}"; old="${e##*:}"
-        [ -d "/proc/$p" ] && echo "$old" > "/proc/$p/oom_score_adj" 2>/dev/null
+        [ -d "/proc/$p" ] && echo "$old" > "/proc/$p/oom_score_adj" 2>/dev/null && n=$(( n + 1 ))
     done
     OOM_SAVED=""
+    # 印出來才有辦法確認保險真的有生效，不然只能自己去 cat /proc/<pid>/oom_score_adj
+    [ "$n" -gt 0 ] && log "已還原 $n 個 sshd 的 oom_score_adj"
+    return 0
 }
 
 # ---------- CPU ----------
@@ -164,13 +169,25 @@ _mon_cpu() {
         load=$(cut -d' ' -f1-3 /proc/loadavg)
         # steal 對 KVM guest 是最關鍵的一項：它代表 CPU 被 hypervisor 拿去給別的 VM。
         # 壓測分數低但 steal 高 -> 問題在 host 超賣，不是這台機器慢。
-        # 欄位順序在不同 sysstat 版本會變，所以先從表頭找欄號，找不到才退回寫死的位置。
-        cpu=$(mpstat 1 1 2>/dev/null | awk '
-            BEGIN { u=3; s=5; st=9; id=0 }
-            /%usr/ { for (i=1; i<=NF; i++) {
-                       if ($i=="%usr") u=i; else if ($i=="%sys") s=i
-                       else if ($i=="%steal") st=i; else if ($i=="%idle") id=i } }
-            /Average|平均/ { printf "usr=%s%% sys=%s%% steal=%s%% idle=%s%%", $u, $s, $st, (id ? $id : $NF) }')
+        #
+        # 千萬不要拿「表頭的欄號」去索引 Average 行 -- 兩者欄數不一樣。
+        # CentOS 7 預設 en_US.UTF-8，mpstat 的時間印成 12 小時制:
+        #   02:57:18 PM  CPU  %usr ...   <- 表頭前面兩欄 (時間 + PM)，%idle 在第 13 欄
+        #   Average:     all  99.75 ...  <- 資料行前面只有一欄，idle 其實在第 12 欄
+        # 照表頭的欄號讀會整排錯位一格，讀到的 usr 其實是 %nice、steal 其實是 %guest，
+        # idle 則指到不存在的欄位而變成空字串。這個 bug 靜靜地錯，數字看起來很正常。
+        #
+        # 正解: 以資料行自己的 "all" 那欄當基準往後數，不管前面有幾欄時間戳都對。
+        # CPU 之後的順序 (usr nice sys iowait irq soft steal guest gnice idle) 跨
+        # sysstat 版本固定，新欄位一律往後加，所以 idle 取 $NF 最保險。
+        # LC_ALL=C 則確保關鍵字是 Average/all 而不是被翻譯過的字串。
+        cpu=$(LC_ALL=C mpstat 1 1 2>/dev/null | awk '
+            /Average|平均/ {
+                a = 0
+                for (i = 1; i <= NF; i++) if ($i == "all") a = i
+                if (!a) next
+                printf "usr=%s%% sys=%s%% steal=%s%% idle=%s%%", $(a+1), $(a+3), $(a+7), $NF
+            }')
         printf '  %s  load=%s  %s\n' "$ts" "$load" "$cpu" | tee -a "$LOG"
         sleep 3
     done
