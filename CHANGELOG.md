@@ -6,12 +6,20 @@
 
 ## [未發布]
 
+### 變更（不相容）
+
+- **測試產物改為落在執行時所在的目錄。** 舊版一啟動就 `cd` 到腳本所在目錄，所以不管你在哪裡執行，log 都寫回腳本旁邊的 `logs/`。現在不再 `cd`，`logs/` 與 fio 測試檔都跟著 CWD 走 —— 想把結果收在哪，`cd` 過去再跑即可。腳本放在共用路徑（如 `/opt/tools/`）時差別最明顯
+- `LOGDIR` / `DISK_DIR` 啟動時解析成絕對路徑，log 印出的位置不再有「相對誰」的疑問，也讓清理 trap 不受後續 cd 影響
+- 目前目錄不可寫時直接中止並印出 `pwd`，而不是跑完才發現寫不進去
+- `usage()` 額外印出這次的輸出目錄
+
 ### 新增
 
 - CPU 監看加上 `%steal`。這是 KVM guest 最關鍵的一項 —— steal 高代表 CPU 被 hypervisor 拿去給別的 VM，能區分「host 超賣」與「這台 VM 本身慢」
 - CPU 測試結束時提示 steal 的判讀方式
 - `DUR` 啟動時驗證必須為正整數
 - `.gitattributes` 強制 `*.sh` 使用 LF —— 帶著 CRLF 的腳本在 Linux 上會噴 `/usr/bin/env: bash\r: No such file or directory`，很難聯想到是行尾問題
+- `.gitignore` 排除 `logs/` 與 `.fio-test.*`。產物現在會落在執行目錄，從 repo 目錄直接跑就會生在版控裡；fio 殘骸可能是個 4GB 的檔案
 
 ### 修正
 

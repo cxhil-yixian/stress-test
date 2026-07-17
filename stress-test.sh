@@ -13,10 +13,15 @@
 #   DUR=60            每項持續秒數
 #   DISK_DIR=./logs   fio 測試檔位置 (測完自動刪除)
 #
-# log 都在 ./logs/
+# 測試產物 (log、fio 測試檔) 都落在「你執行時所在的目錄」底下的 logs/，
+# 跟腳本放在哪無關。要換地方就 cd 過去再跑。
 
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")" || { echo "切不進腳本所在目錄"; exit 1; }
+
+# 不 cd 到腳本所在目錄 -- 測試產物要跟著「執行時的目錄」走，腳本放哪不影響。
+# 但 usage() 得讀自己，而 $0 可能是相對路徑 (bash ../x/stress-test.sh)，
+# 所以先在子 shell 裡解析出絕對路徑，不動到外面的 CWD。
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # 先驗身分再建目錄，不然非 root 執行會留下一個空的 logs/ 才跟你說不能跑
 [ "$(id -u)" = "0" ] || { echo "要 root"; exit 1; }
@@ -26,10 +31,18 @@ DUR="${DUR:-60}"
 case "$DUR" in ''|*[!0-9]*) echo "DUR 要是正整數，收到: $DUR"; exit 2 ;; esac
 [ "$DUR" -ge 1 ] || { echo "DUR 要 >= 1"; exit 2; }
 
-LOGDIR="./logs"; mkdir -p "$LOGDIR"
+# 相對於 CWD 建立，再轉成絕對路徑存起來。
+# 轉絕對路徑有兩個好處：log 裡印出的路徑不會有「這是相對誰」的疑問，
+# 而且之後任何 cd 都不會讓 trap 清錯檔案。
+LOGDIR="./logs"
+mkdir -p "$LOGDIR" || { echo "無法在目前目錄建立 logs/ (pwd: $PWD)"; exit 1; }
+LOGDIR="$(cd "$LOGDIR" && pwd)"
+
 # fio 測試檔預設就寫在 logs/ 裡，跑完由 trap 刪掉。
 # 注意這跟 /tmp 在同一個檔案系統時，數據不會有差別。
-DISK_DIR="${DISK_DIR:-$LOGDIR}"; mkdir -p "$DISK_DIR"
+DISK_DIR="${DISK_DIR:-$LOGDIR}"
+mkdir -p "$DISK_DIR" || { echo "無法建立 $DISK_DIR"; exit 1; }
+DISK_DIR="$(cd "$DISK_DIR" && pwd)"
 TS=$(date +%Y%m%d-%H%M%S)
 
 # fio 測試檔的路徑存成全域，讓中斷時的 trap 也清得到。
@@ -58,7 +71,10 @@ _scan_stale "$LOGDIR"
 
 # 印出檔案開頭那段用法說明 (shebang 之後、第一個非註解行之前)。
 # 不寫死行號，改動上面的註解區塊不用回來同步。
-usage() { awk 'NR>1{ if (!/^#/) exit; sub(/^# ?/,""); print }' "$0"; }
+usage() {
+    awk 'NR>1{ if (!/^#/) exit; sub(/^# ?/,""); print }' "$SELF"
+    echo "這次的輸出會寫到: $LOGDIR"
+}
 
 # 缺工具時給明確訊息，而不是讓它噴 command not found
 need() {
