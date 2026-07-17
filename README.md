@@ -4,6 +4,56 @@
 
 腳本的重點不只是「把機器操滿」，而是**讓數據可信**：磁碟測試會偵測 KVM host cache 汙染、SWAP 測試會先保護 sshd 不被 OOM killer 殺掉、NTP 測試不管怎麼中斷都會把時鐘還原。
 
+## 一鍵執行
+
+不落地，複製貼上就跑（需要 root）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
+```
+
+**參數要接在 `<(...)` 之後**，不是接在 `curl` 後面 —— 這是最容易寫錯的地方。把最後的 `cpu` 換掉就是其他項目：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) ram
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) disk
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) swap
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) ntp
+bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) all
+```
+
+環境變數寫在最前面。先用短時間走一遍流程是個好習慣：
+
+```bash
+DUR=10 bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) all
+```
+
+跑之前先把相依工具裝好，否則腳本只會告訴你缺什麼然後結束：
+
+```bash
+yum install -y fio sysstat stress-ng chrony
+```
+
+log 會寫到**你當下所在目錄**的 `logs/`。在 `~` 底下跑就是 `/root/logs/`，想收在別的地方就先 `cd` 過去。
+
+### 幾個容易踩的點
+
+**為什麼是 `bash <(...)` 而不是 `curl ... | bash`？** 後者腳本是從 stdin 讀進來的，bash 邊讀邊執行；測試工具若有任何動到 stdin 的行為，就會把還沒讀到的腳本內容吃掉，症狀是腳本莫名其妙跑到一半就結束。`bash <(...)` 沒有這個問題。
+
+**URL 一定要有分支名。** `raw.githubusercontent.com` 的格式是 `/<使用者>/<repo>/<分支>/<路徑>`，少了中間的 `main` 會拿到 404。
+
+**要可重現的話把 `main` 換成 commit SHA。** `main` 隨時會變，同一行指令兩週後跑的可能不是同一份腳本。
+
+### 或者存成檔案
+
+要重複跑很多次、或機器連不上 GitHub 時：
+
+```bash
+curl -fsSL -o stress-test.sh https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
+chmod +x stress-test.sh
+./stress-test.sh cpu
+```
+
 ## 需求
 
 - CentOS 7.9（其他 systemd + Linux 發行版應該也能跑，未驗證）
@@ -25,21 +75,6 @@
   | ntp | `chronyc`（chrony） |
 
   工具缺少時腳本會明確指出缺哪幾個，不會噴 `command not found`。
-
-## 取得
-
-```bash
-curl -fsSL -o stress-test.sh https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
-chmod +x stress-test.sh
-```
-
-也可以不落地直接跑。**參數要接在 `<(...)` 後面**：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
-```
-
-用 `bash <(...)` 而不是 `curl ... | bash`：後者腳本是從 stdin 讀進來的，測試工具若有任何動到 stdin 的行為，就會把還沒讀到的腳本內容吃掉。
 
 ## 用法
 
