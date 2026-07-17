@@ -9,55 +9,53 @@
 
 腳本的重點不只是「把機器操滿」，而是**讓數據可信**：磁碟測試會偵測 KVM host cache 汙染、SWAP 測試會先保護 sshd 不被 OOM killer 殺掉、NTP 測試不管怎麼中斷都會把時鐘還原、網路測試會把 CPU 峰值跟吞吐擺在一起讓你判斷瓶頸在哪。
 
-## 一鍵執行
+## 測試指令（複製即用）
 
-不落地，複製貼上就跑（需要 root）：
+不落地，複製整段貼上就跑（**需要 root**）。第一行把腳本網址存成 `$S`，後面每條指令都用它 —— **參數接在 `<(...)` 之後**，不是接在 `curl` 後面。
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) cpu
-```
-
-**參數要接在 `<(...)` 之後**，不是接在 `curl` 後面 —— 這是最容易寫錯的地方。把最後的 `cpu` 換掉就是其他項目：
+先裝工具（缺了腳本只會告訴你缺什麼然後結束）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) ram
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) disk
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) swap
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) ntp
-bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) all
+yum install -y fio sysstat stress-ng chrony                    # 本機壓測
+yum install -y epel-release && yum install -y wrk              # 網路測試才需要 wrk
 ```
 
-環境變數寫在最前面。先用短時間走一遍流程是個好習慣：
+### 本機壓測（CPU / 記憶體 / 磁碟 / SWAP / NTP）
 
 ```bash
-DUR=10 bash <(curl -fsSL https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh) all
+S=https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
+
+bash <(curl -fsSL $S) cpu          # CPU 壓測
+bash <(curl -fsSL $S) ram          # 記憶體壓測
+bash <(curl -fsSL $S) disk         # 磁碟讀寫
+bash <(curl -fsSL $S) swap         # SWAP 壓測
+bash <(curl -fsSL $S) ntp          # NTP 時間偏移 2 分鐘
+bash <(curl -fsSL $S) all          # 跑 cpu/ram/disk/swap（不含 ntp）
+
+DUR=10  bash <(curl -fsSL $S) all          # 每項只跑 10 秒，先確認流程
+DUR=300 bash <(curl -fsSL $S) disk         # 拉長時間量磁碟尾端延遲
 ```
 
-跑之前先把相依工具裝好，否則腳本只會告訴你缺什麼然後結束：
+### 網路測試（主機扛下載流量時網站還通不通）
+
+`URL` 只能是你自己的網站（通常是本機），`DL_URL` 建議用你自己的檔案來源。兩者都沒有預設，缺了會擋下。
 
 ```bash
-yum install -y fio sysstat stress-ng chrony
+S=https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
+
+# baseline：只壓網站，建立基準
+URL=http://127.0.0.1/ bash <(curl -fsSL $S) baseline
+
+# traffic：只灌下載流量
+DL_URL=https://你的來源/big.bin bash <(curl -fsSL $S) traffic
+
+# mixed：下載流量 + 網站壓測同時（最接近真實情境）
+URL=http://127.0.0.1/ DL_URL=https://你的來源/big.bin bash <(curl -fsSL $S) mixed
 ```
 
-log 會寫到**你當下所在目錄**的 `logs/`。在 `~` 底下跑就是 `/root/logs/`，想收在別的地方就先 `cd` 過去。
-
-### 幾個容易踩的點
-
-**為什麼是 `bash <(...)` 而不是 `curl ... | bash`？** 後者腳本是從 stdin 讀進來的，bash 邊讀邊執行；測試工具若有任何動到 stdin 的行為，就會把還沒讀到的腳本內容吃掉，症狀是腳本莫名其妙跑到一半就結束。`bash <(...)` 沒有這個問題。
-
-**URL 一定要有分支名。** `raw.githubusercontent.com` 的格式是 `/<使用者>/<repo>/<分支>/<路徑>`，少了中間的 `main` 會拿到 404。
-
-**要可重現的話把 `main` 換成 commit SHA。** `main` 隨時會變，同一行指令兩週後跑的可能不是同一份腳本。
-
-### 或者存成檔案
-
-要重複跑很多次、或機器連不上 GitHub 時：
-
-```bash
-curl -fsSL -o stress-test.sh https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
-chmod +x stress-test.sh
-./stress-test.sh cpu
-```
+> 報告會寫到**你當下所在目錄**的 `logs/`。在 `~` 底下跑就是 `/root/logs/`，想收別的地方先 `cd` 過去。
+>
+> 各參數（`DUR`、`URL`、`DL_URL`、`DL_WORKERS`…）與判讀方式見下方說明。
 
 ## 需求
 
@@ -81,18 +79,27 @@ chmod +x stress-test.sh
 
   工具缺少時腳本會明確指出缺哪幾個，不會噴 `command not found`。
 
-## 用法
+## 執行方式
+
+上面用的是「不落地」形式，適合一次性執行。要重複跑很多次、或機器連不上 GitHub 時，存成檔案更方便：
 
 ```bash
-./stress-test.sh cpu     # CPU 壓測
-./stress-test.sh ram     # 記憶體壓測
-./stress-test.sh disk    # 磁碟讀寫
-./stress-test.sh swap    # SWAP 壓測
-./stress-test.sh ntp     # NTP 時間偏移 2 分鐘
-./stress-test.sh all     # 跑 cpu / ram / disk / swap（不含 ntp）
+curl -fsSL -o stress-test.sh https://raw.githubusercontent.com/cxhil-yixian/stress-test/main/stress-test.sh
+chmod +x stress-test.sh
+./stress-test.sh cpu
 ```
 
 不帶參數執行會印出用法說明與這次的輸出目錄。
+
+### 幾個容易踩的點
+
+**為什麼是 `bash <(...)` 而不是 `curl ... | bash`？** 後者腳本是從 stdin 讀進來的，bash 邊讀邊執行；測試工具若有任何動到 stdin 的行為，就會把還沒讀到的腳本內容吃掉，症狀是腳本莫名其妙跑到一半就結束。`bash <(...)` 沒有這個問題。
+
+**參數要接在 `<(...)` 之後**，不是接在 `curl` 後面 —— 這是最容易寫錯的地方。
+
+**URL 一定要有分支名。** `raw.githubusercontent.com` 的格式是 `/<使用者>/<repo>/<分支>/<路徑>`，少了中間的 `main` 會拿到 404。
+
+**要可重現的話把 `main` 換成 commit SHA。** `main` 隨時會變，同一行指令兩週後跑的可能不是同一份腳本。
 
 ### 輸出位置
 
